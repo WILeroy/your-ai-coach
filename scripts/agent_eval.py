@@ -26,6 +26,7 @@ CASES = [
     ("有没有平台期？", ["get_analytics"], False),
     ("帮我记一下今天的训练：泽奇深蹲 40kg 5组5次。这个动作库里可能没有，没有的话顺便帮我加上",
      ["log_training", "manage_exercises"], True),
+    ("搜一下壶铃摇摆的标准动作要点", ["web_search"], False),
 ]
 
 

@@ -4,6 +4,7 @@ import LineView from './views/LineView.vue'
 import BarView from './views/BarView.vue'
 import TableView from './views/TableView.vue'
 import MetricCardsView from './views/MetricCardsView.vue'
+import SearchResultsView from './views/SearchResultsView.vue'
 import UnknownView from './views/UnknownView.vue'
 
 const store = useChatStore()
@@ -28,6 +29,7 @@ const store = useChatStore()
           <BarView v-else-if="v.view === 'bar'" :spec="v as any" />
           <TableView v-else-if="v.view === 'table'" :spec="v as any" />
           <MetricCardsView v-else-if="v.view === 'metric_cards'" :spec="v as any" />
+          <SearchResultsView v-else-if="v.view === 'search_results'" :spec="v as any" />
           <UnknownView v-else :spec="v as any" />
         </div>
       </transition-group>

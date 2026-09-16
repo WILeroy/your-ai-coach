@@ -44,6 +44,26 @@ export const useChatStore = defineStore('chat', {
       this.views = []
       localStorage.removeItem('fit_chat_session')
     },
+    async deleteSession(sid: string) {
+      try {
+        const r = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}`, { method: 'DELETE' })
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        this.sessions = this.sessions.filter(s => s.session_id !== sid)
+        if (sid === this.sessionId) this.newSession()
+      } catch (e) {
+        console.error('delete session failed', e)
+      }
+    },
+    async deleteAllSessions() {
+      try {
+        const r = await fetch('/api/chat/sessions', { method: 'DELETE' })
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        this.sessions = []
+        this.newSession()
+      } catch (e) {
+        console.error('delete all sessions failed', e)
+      }
+    },
     switchSession(sid: string) {
       this.sessionId = sid
       localStorage.setItem('fit_chat_session', sid)

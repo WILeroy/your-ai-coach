@@ -42,6 +42,33 @@ await page.reload({ waitUntil: 'networkidle' })
 await page.waitForTimeout(1500)
 check('刷新后恢复对话历史', (await page.locator('.msg').count()) >= 4)
 
+// 联网搜索 → 来源卡片
+await page.click('.hbtn:has-text("新会话")')
+await page.waitForTimeout(500)
+await page.fill('textarea', '搜一下壶铃摇摆动作要点')
+await page.click('.send-btn')
+try {
+  await page.waitForSelector('.sr-item', { timeout: 60000 })
+  const links = await page.locator('.sr-item').count()
+  check('联网搜索来源卡片渲染', links >= 2)
+  await page.waitForFunction(() => !document.querySelector('.streaming-cursor'), null, { timeout: 60000 })
+} catch {
+  check('联网搜索来源卡片渲染', false)
+}
+
+// 会话删除
+await page.click('.hbtn:has-text("历史")')
+await page.waitForSelector('.session-item', { timeout: 5000 })
+const before = await page.locator('.session-item').count()
+await page.locator('.session-item .s-del').first().hover()
+await page.locator('.session-item .s-del').first().click()
+await page.waitForTimeout(300)
+// NPopconfirm 确认按钮(传送门渲染在body)
+await page.locator('.n-button--primary-type').first().click()
+await page.waitForTimeout(800)
+const after = await page.locator('.session-item').count()
+check('会话删除(列表减少+重置)', after === before - 1 && (await page.locator('.msg').count()) <= 1)
+
 // 其他页面
 for (const p of ['dashboard', 'trends', 'review', 'plan']) {
   await page.goto('http://127.0.0.1:5200/' + p, { waitUntil: 'networkidle' })

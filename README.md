@@ -102,3 +102,8 @@ python cli.py review
 cd web && npm install playwright-core --no-save && npx playwright install chromium
 FIT_PW=你的口令 node web/e2e-check.mjs
 ```
+
+## v2.2 新增
+
+- **Agent 联网**：`web_search`（搜狗→360→必应多引擎免注册，自动解析真实链接）+ `web_fetch`（trafilatura 正文抽取，含 SSRF 防护）。问动作技术/营养/伤病/时效性问题时自动检索并在画布展示来源卡片
+- **会话管理**：历史抽屉支持单条删除（悬浮🗑）与一键清空，连带清理未完成确认

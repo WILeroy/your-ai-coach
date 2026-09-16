@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import { NPopconfirm } from 'naive-ui'
 import { useChatStore } from '../stores/chat'
 import ChatMessage from '../components/ChatMessage.vue'
 import DynamicCanvas from '../components/DynamicCanvas.vue'
@@ -54,8 +55,25 @@ function send(text?: string) {
         <div v-for="s in store.sessions" :key="s.session_id" class="session-item"
           :class="{ active: s.session_id === store.sessionId }"
           @click="store.switchSession(s.session_id); showSessions = false">
-          <div class="s-title">{{ s.title || s.session_id }}</div>
-          <div class="s-meta">{{ (s.last_at || '').slice(0, 16).replace('T', ' ') }} · {{ s.msg_count }}条</div>
+          <div class="s-body">
+            <div class="s-title">{{ s.title || s.session_id }}</div>
+            <div class="s-meta">{{ (s.last_at || '').slice(0, 16).replace('T', ' ') }} · {{ s.msg_count }}条</div>
+          </div>
+          <n-popconfirm @positive-click="store.deleteSession(s.session_id)">
+            <template #trigger>
+              <button class="s-del" title="删除会话"
+                @click.stop>🗑</button>
+            </template>
+            删除该会话的全部对话？
+          </n-popconfirm>
+        </div>
+        <div v-if="store.sessions.length" class="drawer-footer">
+          <n-popconfirm @positive-click="store.deleteAllSessions()">
+            <template #trigger>
+              <button class="clear-all-btn">清空全部会话</button>
+            </template>
+            确定清空所有历史对话？此操作不可恢复。
+          </n-popconfirm>
         </div>
       </div>
 
@@ -119,8 +137,23 @@ function send(text?: string) {
 .session-item { padding: 8px 10px; border-radius: 8px; cursor: pointer; }
 .session-item:hover { background: var(--card); }
 .session-item.active { background: var(--orange-soft); }
+.session-item { display: flex; align-items: center; gap: 8px; }
+.s-body { flex: 1; min-width: 0; }
 .s-title { font-size: 13px; color: var(--text-bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .s-meta { font-size: 10px; color: var(--text-dim); }
+.s-del {
+  background: none; border: none; cursor: pointer; font-size: 12px;
+  color: var(--text-dim); padding: 4px 6px; border-radius: 6px; flex-shrink: 0;
+  opacity: 0; transition: opacity 0.15s;
+}
+.session-item:hover .s-del { opacity: 1; }
+.s-del:hover { color: var(--red); background: rgba(224,85,106,0.1); }
+.drawer-footer { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; text-align: center; }
+.clear-all-btn {
+  background: none; border: 1px solid var(--border); color: var(--text-dim);
+  font-size: 11px; padding: 4px 14px; border-radius: 8px; cursor: pointer;
+}
+.clear-all-btn:hover { color: var(--red); border-color: var(--red); }
 
 .chat-list { flex: 1; overflow-y: auto; padding: 18px; }
 .welcome {

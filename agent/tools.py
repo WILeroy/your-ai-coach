@@ -6,6 +6,13 @@
 - 确认状态持久化到 SQLite (agent_pending_actions)，多 worker 安全
 """
 import sys, os, json, uuid
+import re
+import html as html_mod
+import socket
+import ipaddress
+import urllib.request
+import urllib.parse
+from html.parser import HTMLParser
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime, timedelta, date
@@ -412,6 +419,269 @@ def tool_search_exercises(keyword, **kwargs):
     return {"results": rows}
 
 
+# ═══════════════════════════════════════════════
+# 联网工具 (免注册: 必应中国版抓取 + 网页正文读取)
+# ═══════════════════════════════════════════════
+
+_WEB_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+
+
+def _strip_tags(s):
+    return html_mod.unescape(re.sub(r"<[^>]+>", "", s or "")).strip()
+
+
+def tool_web_search(query, max_results=5, **kwargs):
+    """联网搜索(搜狗→360→必应 多引擎免注册)。返回标题/链接/摘要，自动在画布渲染来源卡片"""
+    query = (query or "").strip()
+    if not query:
+        return {"error": "query 不能为空"}
+    max_results = min(max(int(max_results or 5), 1), 8)
+
+    results = (_search_sogou(query, max_results)
+               or _search_so(query, max_results)
+               or _search_bing(query, max_results))
+
+    if not results:
+        return {"error": "搜索暂不可用或无结果", "hint": "请稍后重试或换个关键词"}
+    return {
+        "query": query, "results": results,
+        "view_spec": {"view": "search_results",
+                      "title": "🔍 %s" % query, "results": results},
+    }
+
+
+def _http_get(url, timeout=8, headers=None):
+    h = {"User-Agent": _WEB_UA, "Accept-Language": "zh-CN,zh;q=0.9"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "ignore")
+
+
+def _resolve_redirect(link, base="https://www.sogou.com"):
+    """解析 /link?url=... 跳转链接的真实URL；失败返回原链接"""
+    if not link.startswith("/link") and not link.startswith("https://www.so.com/link"):
+        return link
+    url = base + link if link.startswith("/") else link
+    try:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            resp = opener.open(urllib.request.Request(url, headers={
+                "User-Agent": _WEB_UA}), timeout=6)
+            page = resp.read(4096).decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location", "")
+            return loc if loc.startswith("http") else link
+        m = (re.search(r'url=([^"\'>&\s]+)', page)
+             or re.search(r'(https?://[^\s"\'<>]+)', page))
+        return html_mod.unescape(m.group(1)) if m else link
+    except Exception as e:
+        return link
+
+
+def _block_snippet(blk, min_len=25):
+    """从结果块兜底提取摘要"""
+    for sel in (".fz-mid", ".str-text-info", ".str_info", ".space-txt",
+                ".text-layout", ".res-desc", ".g-link", "p"):
+        el = blk.select_one(sel)
+        if el:
+            t = el.get_text(" ", strip=True)
+            if len(t) >= min_len:
+                return t[:160]
+    texts = [t.strip() for t in blk.stripped_strings if len(t.strip()) > min_len]
+    return texts[0][:160] if texts else ""
+
+
+def _search_sogou(query, max_results):
+    try:
+        body = _http_get("https://www.sogou.com/web?query=" + urllib.parse.quote(query))
+    except Exception:
+        return []
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(body, "html.parser")
+    items = []
+    for blk in soup.select("div.vrwrap"):
+        a = blk.select_one("h3 a[href]")
+        if not a:
+            continue
+        title = a.get_text(strip=True)
+        link = a.get("href", "")
+        if not title:
+            continue
+        items.append({"title": title[:80], "url": link, "snippet": _block_snippet(blk)})
+        if len(items) >= max_results:
+            break
+    if not items:
+        return []
+    # 并行解析跳转链接
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(len(items), 5)) as ex:
+        real_urls = list(ex.map(lambda it: _resolve_redirect(it["url"]), items))
+    for it, u in zip(items, real_urls):
+        it["url"] = u
+    return [it for it in items if it["url"].startswith("http")]
+
+
+def _search_so(query, max_results):
+    try:
+        body = _http_get("https://www.so.com/s?q=" + urllib.parse.quote(query))
+    except Exception:
+        return []
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(body, "html.parser")
+    items = []
+    for blk in soup.select("li.res-list, div.res-list, li[class*=res-list]"):
+        a = blk.select_one("h3 a[href]")
+        if not a:
+            continue
+        title = a.get_text(strip=True)
+        link = a.get("href", "")
+        if not title or not link:
+            continue
+        items.append({"title": title[:80], "url": link, "snippet": _block_snippet(blk)})
+        if len(items) >= max_results:
+            break
+    if not items:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(len(items), 5)) as ex:
+        real_urls = list(ex.map(lambda it: _resolve_redirect(it["url"], "https://www.so.com"), items))
+    for it, u in zip(items, real_urls):
+        it["url"] = u
+    return [it for it in items if it["url"].startswith("http")]
+
+
+def _search_bing(query, max_results):
+    try:
+        body = _http_get("https://cn.bing.com/search?q=" + urllib.parse.quote(query))
+    except Exception:
+        return []
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(body, "html.parser")
+    results = []
+    for blk in soup.select("li.b_algo"):
+        a = blk.select_one("h2 a[href]") or blk.select_one("a[href^='http']")
+        if not a or not a.get("href", "").startswith("http"):
+            continue
+        title = _strip_tags(a.decode_contents())
+        # 清理可能残留的显示URL前缀 (如 "baidu.com › item")
+        title = re.sub(r"^[a-z0-9.\-]+\.[a-z]{2,}(\s*›[^ht]*)?(https?://\S+)?\s*", "", title) or title
+        p = blk.select_one(".b_caption p") or blk.select_one("p")
+        snippet = _strip_tags(p.decode_contents())[:160] if p else ""
+        if title:
+            results.append({"title": title[:80], "url": a["href"], "snippet": snippet})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _assert_public_http_url(url):
+    """SSRF 防护: 仅允许 http/https + 公网IP + 80/443端口"""
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        raise ValueError("URL 无法解析")
+    if p.scheme not in ("http", "https"):
+        raise ValueError("仅支持 http/https")
+    if p.port not in (None, 80, 443):
+        raise ValueError("仅支持 80/443 端口")
+    host = p.hostname
+    if not host:
+        raise ValueError("缺少主机名")
+    # 解析全部IP并检查
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        raise ValueError("主机名无法解析")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise ValueError("禁止访问内网/回环地址")
+
+
+class _TextExtractor(HTMLParser):
+    """提取 <title> 与正文可见文本"""
+    _SKIP = {"script", "style", "noscript", "svg"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self.parts = []
+        self._skip_depth = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip_depth += 1
+        if tag == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self._skip_depth:
+            self._skip_depth -= 1
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+            return
+        if self._skip_depth:
+            return
+        t = data.strip()
+        if t:
+            self.parts.append(t)
+
+
+def tool_web_fetch(url, max_chars=4000, **kwargs):
+    """读取网页正文文本(trafilatura 抽取主内容)。部分反爬站点(如知乎)会失败"""
+    url = (url or "").strip()
+    try:
+        _assert_public_http_url(url)
+    except ValueError as e:
+        return {"error": "URL 不允许: %s" % e}
+
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _WEB_UA, "Accept-Language": "zh-CN,zh;q=0.9"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read(2_000_000)  # 上限2MB
+            charset = r.headers.get_content_charset() or "utf-8"
+            body = raw.decode(charset, "ignore")
+    except Exception as e:
+        return {"error": "网页读取失败: %s" % str(e)[:80],
+                "hint": "该站点可能拦截了程序访问，可改用搜索摘要"}
+
+    import trafilatura
+    text = trafilatura.extract(body, include_comments=False,
+                               include_tables=True, favor_recall=True) or ""
+    title = ""
+    tm = re.search(r"<title[^>]*>(.*?)</title>", body, re.S)
+    if tm:
+        title = _strip_tags(tm.group(1))
+    if not text:
+        # trafilatura 失败时退回粗提取
+        ex = _TextExtractor()
+        try:
+            ex.feed(body)
+        except Exception:
+            pass
+        text = re.sub(r"\s{2,}", " ", " ".join(ex.parts)).strip()
+        title = title or ex.title.strip()
+    max_chars = min(max(int(max_chars or 4000), 500), 8000)
+    if not text:
+        return {"error": "未能提取正文(可能是JS渲染页面)"}
+    return {"title": (title or "")[:100], "url": url,
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars}
+
+
 def tool_show_view(page, **kwargs):
     """让前端切换页面: coach/dashboard/trends/review/plan"""
     valid = {"coach", "dashboard", "trends", "review", "plan"}
@@ -738,6 +1008,10 @@ TOOL_SCHEMAS = [
     _fn("get_body_metrics", "身体指标历史(体重/睡眠/晨脉)", {"days": _num("回看天数，默认90")}),
     _fn("search_exercises", "模糊搜索动作库。同一关键词无结果时不要重复搜索，直接告知用户并建议用 manage_exercises 新增",
         {"keyword": _str("关键词")}, ["keyword"]),
+    _fn("web_search", "联网搜索(训练技术/营养/伤病康复/器材/时效性问题用)。返回标题/链接/摘要并自动在画布展示来源",
+        {"query": _str("搜索关键词"), "max_results": _num("条数，默认5，最多8")}, ["query"]),
+    _fn("web_fetch", "读取指定网页正文纯文本。web_search摘要不够时用；部分反爬站点会失败",
+        {"url": _str("完整URL http/https"), "max_chars": _num("正文截取字数，默认4000")}, ["url"]),
     _fn("show_view", "让用户界面切换页面", {"page": _str("页面", enum=["coach", "dashboard", "trends", "review", "plan"])}, ["page"]),
     _fn("log_training", "记录一次训练(需确认)。sets每项:{exercise,groups:[{kg,reps}]}。预览会返回 missing_exercises(库外动作及建议pattern)，用户同意新增时同一轮并行调用 manage_exercises(add)+log_training，系统会一次确认全部执行",
         {"date": _str("日期YYYY-MM-DD，默认今天"), "stype": _str("类型: legs/push/pull/interval/lsd/relax"),
@@ -785,6 +1059,8 @@ TOOL_MAP = {
     "get_plan": tool_get_plan,
     "get_body_metrics": tool_get_body_metrics,
     "search_exercises": tool_search_exercises,
+    "web_search": tool_web_search,
+    "web_fetch": tool_web_fetch,
     "show_view": tool_show_view,
     "log_training": tool_log_training,
     "update_session": tool_update_session,

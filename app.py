@@ -118,6 +118,28 @@ def api_chat_history():
     return jsonify([{"role": r['role'], "content": r['content']} for r in rows])
 
 
+@app.route("/api/chat/sessions/<sid>", methods=["DELETE"])
+def api_chat_delete_session(sid):
+    """删除单个会话(消息+关联pending)"""
+    conn = get_db()
+    n1 = conn.execute("DELETE FROM chat_messages WHERE session_id=?", [sid]).rowcount
+    conn.execute("DELETE FROM agent_pending_actions WHERE session_id=?", [sid])
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "deleted_messages": n1})
+
+
+@app.route("/api/chat/sessions", methods=["DELETE"])
+def api_chat_delete_all_sessions():
+    """清空全部会话"""
+    conn = get_db()
+    n1 = conn.execute("DELETE FROM chat_messages").rowcount
+    conn.execute("DELETE FROM agent_pending_actions")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "deleted_messages": n1})
+
+
 def _sse_response(gen):
     return Response(
         stream_with_context(gen),
