@@ -1,0 +1,21 @@
+import { chromium } from 'playwright-core'
+const PW = process.env.FIT_PW
+const browser = await chromium.launch()
+const page = await browser.newPage({ viewport: { width: 1380, height: 850 } })
+await page.goto('http://127.0.0.1:5200/login', { waitUntil: 'networkidle' })
+await page.screenshot({ path: '/tmp/shot-login.png' })
+await page.fill('input[type=password]', PW)
+await page.click('button[type=submit]')
+await page.waitForURL('**/coach', { timeout: 8000 })
+await page.waitForTimeout(1200)
+await page.screenshot({ path: '/tmp/shot-coach.png' })
+await page.goto('http://127.0.0.1:5200/dashboard', { waitUntil: 'networkidle' })
+await page.waitForTimeout(1500)
+await page.screenshot({ path: '/tmp/shot-dashboard.png' })
+// 移动端
+const m = await browser.newPage({ viewport: { width: 390, height: 844 } })
+await m.goto('http://127.0.0.1:5200/coach', { waitUntil: 'networkidle' })
+await m.waitForTimeout(800)
+await m.screenshot({ path: '/tmp/shot-mobile.png' })
+await browser.close()
+console.log('screenshots done')

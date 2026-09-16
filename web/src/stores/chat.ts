@@ -64,7 +64,7 @@ export const useChatStore = defineStore('chat', {
       this.messages.push({ role: 'user', content })
 
       const streamMsg: ChatMessage = { role: 'assistant', content: '', toolTags: [], streaming: true }
-      this.messages.push(streamMsg)
+      const idx = this.messages.push(streamMsg) - 1
       let streamText = ''
       let tags: { name: string; error?: boolean }[] = []
 
@@ -80,8 +80,8 @@ export const useChatStore = defineStore('chat', {
         const decoder = new TextDecoder()
         let partial = ''
         const updateStream = () => {
-          const m = this.messages[this.messages.length - 1]
-          if (m === streamMsg) { m.content = streamText; m.toolTags = [...tags]; }
+          // 按索引替换对象，保证 Vue 响应式触发重渲染
+          this.messages[idx] = { ...this.messages[idx], content: streamText, toolTags: [...tags] }
         }
 
         while (true) {
@@ -125,28 +125,27 @@ export const useChatStore = defineStore('chat', {
                 break
               case 'pending_confirm': {
                 const pc: PendingConfirm = { action_id: payload.action_id, tool: payload.tool, preview: payload.preview || {} }
-                streamMsg.confirm = pc
-                streamMsg.streaming = false
+                this.messages[idx] = { ...this.messages[idx], confirm: pc, streaming: false }
                 break
               }
               case 'done':
                 streamText = payload.reply || streamText
-                streamMsg.streaming = false
+                this.messages[idx] = { ...this.messages[idx], streaming: false }
                 updateStream()
                 break
               case 'error':
                 streamText += `\n\n❌ ${payload.message || '出错了'}`
-                streamMsg.streaming = false
+                this.messages[idx] = { ...this.messages[idx], streaming: false }
                 updateStream()
                 break
             }
           }
         }
-        streamMsg.streaming = false
-        if (!streamMsg.content && !streamMsg.confirm) streamMsg.content = '(空回复，请重试)'
+        this.messages[idx] = { ...this.messages[idx], streaming: false,
+          content: streamText || this.messages[idx].content || (this.messages[idx].confirm ? '' : '(空回复，请重试)') }
       } catch (e: any) {
-        streamMsg.streaming = false
-        streamMsg.content = streamText || `网络出错: ${e.message || '请重试'}`
+        this.messages[idx] = { ...this.messages[idx], streaming: false,
+          content: streamText || `网络出错: ${e.message || '请重试'}` }
       } finally {
         this.sending = false
         this.loadSessions()
@@ -157,7 +156,7 @@ export const useChatStore = defineStore('chat', {
       if (!pc) return
       this.sending = true
       const streamMsg: ChatMessage = { role: 'assistant', content: '', toolTags: [], streaming: true }
-      this.messages.push(streamMsg)
+      const idx = this.messages.push(streamMsg) - 1
       let streamText = ''
       let tags: { name: string; error?: boolean }[] = []
       try {
@@ -171,8 +170,7 @@ export const useChatStore = defineStore('chat', {
         const decoder = new TextDecoder()
         let partial = ''
         const updateStream = () => {
-          const m = this.messages[this.messages.length - 1]
-          if (m === streamMsg) { m.content = streamText; m.toolTags = [...tags] }
+          this.messages[idx] = { ...this.messages[idx], content: streamText, toolTags: [...tags] }
         }
         while (true) {
           const { done, value } = await reader.read()
@@ -203,24 +201,24 @@ export const useChatStore = defineStore('chat', {
                 break
               case 'done':
                 streamText = payload.reply || streamText
-                streamMsg.streaming = false
+                this.messages[idx] = { ...this.messages[idx], streaming: false }
                 updateStream()
                 break
               case 'error':
                 streamText += `\n\n❌ ${payload.message || '出错了'}`
-                streamMsg.streaming = false
+                this.messages[idx] = { ...this.messages[idx], streaming: false }
                 updateStream()
                 break
             }
           }
         }
-        streamMsg.streaming = false
-        if (!streamMsg.content) streamMsg.content = streamText || '(完成)'
+        this.messages[idx] = { ...this.messages[idx], streaming: false,
+          content: streamText || '(完成)' }
         pc.preview = {} // disable old card buttons
         ;(pc as any).done = true
       } catch (e: any) {
-        streamMsg.streaming = false
-        streamMsg.content = `确认出错: ${e.message || '请重试'}`
+        this.messages[idx] = { ...this.messages[idx], streaming: false,
+          content: `确认出错: ${e.message || '请重试'}` }
       } finally {
         this.sending = false
       }

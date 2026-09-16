@@ -95,3 +95,10 @@ cd web && npm run dev
 python cli.py log 2026-09-16 legs --rpe 8 --sleep 7
 python cli.py review
 ```
+
+## E2E 测试 (Playwright)
+
+```bash
+cd web && npm install playwright-core --no-save && npx playwright install chromium
+cd .. && FIT_PW=你的口令 node scripts/e2e-check.mjs
+```
