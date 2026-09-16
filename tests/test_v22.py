@@ -100,3 +100,34 @@ def test_chat_session_delete_api():
     n2 = conn.execute("SELECT COUNT(*) FROM agent_pending_actions WHERE session_id='test-del-sess'").fetchone()[0]
     conn.close()
     assert n1 == 0 and n2 == 0
+
+
+def test_search_exercises_batch():
+    from agent.tools import tool_search_exercises
+    r = tool_search_exercises("引体,划船,弯举,不存在的动作xyz")
+    assert "groups" in r
+    assert len(r["groups"]) == 4
+    # 引体应命中 引体/高位下拉
+    yinti = next(g for g in r["groups"] if g["keyword"] == "引体")
+    assert any("引体" in x["name"] for x in yinti["results"])
+    # 单关键词保持旧格式
+    r2 = tool_search_exercises("卧推")
+    assert "results" in r2 and len(r2["results"]) >= 1
+
+
+def test_summarize_fallback_never_empty(monkeypatch):
+    """兜底总结两次空响应时，必须返回工具结果拼接(绝不空)"""
+    import agent.core as core
+
+    class _Msg:
+        class message:
+            content = ""
+    class _Resp:
+        choices = [_Msg()]
+    def fake_chat(m, tools=None, max_tokens=None, tool_choice=None):
+        return _Resp()
+    monkeypatch.setattr(core, "chat", fake_chat)
+    out = core._summarize_fallback(
+        [{"role": "user", "content": "hi"}],
+        [{"tool": "get_plan", "args": {}, "result_preview": '{"cycle": {...}}'}])
+    assert out and "get_plan" in out

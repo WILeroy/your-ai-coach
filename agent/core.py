@@ -200,22 +200,28 @@ def _agent_loop(messages, tool_calls_log, session_id, user_text, _retryed=False)
 
 
 def _summarize_fallback(messages, tool_calls_log):
-    """工具轮耗尽仍无文字时，强制一次无工具总结"""
+    """工具轮耗尽仍无文字时，强制无工具总结；空响应重试一次，仍空则拼接工具结果"""
     if not tool_calls_log:
         return ""
     import copy
     m = copy.deepcopy(messages)
-    m.append({"role": "user",
-              "content": "(系统提示: 请根据以上工具调用结果，直接给用户一个简洁的中文总结回复，不要再调用工具)"})
-    try:
-        resp = chat(m, tools=None, max_tokens=512)
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        # 极端情况: 用工具结果拼一个摘要
-        parts = []
-        for t in tool_calls_log[-3:]:
-            parts.append("[%s] %s" % (t["tool"], t["result_preview"][:100]))
-        return "查询完成：\n" + "\n".join(parts)
+    nudges = [
+        "(系统提示: 请根据以上工具调用结果，直接给用户一个简洁的中文总结回复，不要再调用工具)",
+        "(系统: 必须输出文字回复。根据以上工具结果总结，给用户可读的中文答复)",
+    ]
+    for nudge in nudges:
+        try:
+            resp = chat(m + [{"role": "user", "content": nudge}], tools=None, max_tokens=512)
+            content = (resp.choices[0].message.content or "").strip()
+            if content:
+                return content
+        except Exception:
+            continue
+    # 兜底的兜底: 用工具结果拼一个摘要，绝不返回空
+    parts = []
+    for t in tool_calls_log[-4:]:
+        parts.append("[%s] %s" % (t["tool"], t["result_preview"][:120]))
+    return "查询完成：\n" + "\n".join(parts)
 
 
 # ═══════════════ 确认流程 ═══════════════

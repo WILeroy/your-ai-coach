@@ -410,11 +410,26 @@ def tool_get_body_metrics(days=90, **kwargs):
 
 
 def tool_search_exercises(keyword, **kwargs):
-    """模糊搜索动作库"""
+    """模糊搜索动作库。支持逗号分隔批量查询多个动作名"""
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return {"error": "keyword 不能为空"}
     conn = get_db()
+    # 批量模式: 逗号/顿号分隔
+    parts = [p.strip() for p in re.split(r"[,，、]", keyword) if p.strip()]
+    if len(parts) > 1:
+        groups = []
+        for p in parts:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT name, pattern, equipment, is_main FROM exercises WHERE name LIKE ? ORDER BY is_main DESC, name LIMIT 10",
+                ["%" + p + "%"]).fetchall()]
+            groups.append({"keyword": p, "exact": next((r["name"] for r in rows if r["name"] == p), None),
+                           "results": rows})
+        conn.close()
+        return {"groups": groups}
     rows = [dict(r) for r in conn.execute(
         "SELECT name, pattern, equipment, is_main FROM exercises WHERE name LIKE ? ORDER BY is_main DESC, name LIMIT 20",
-        ["%" + keyword + "%"]).fetchall()]
+        ["%" + parts[0] + "%"]).fetchall()]
     conn.close()
     return {"results": rows}
 
@@ -1006,7 +1021,7 @@ TOOL_SCHEMAS = [
         ["kind"]),
     _fn("get_plan", "查周期计划日历+目标进度", {"cycle": _str("current或周期ID，默认current")}),
     _fn("get_body_metrics", "身体指标历史(体重/睡眠/晨脉)", {"days": _num("回看天数，默认90")}),
-    _fn("search_exercises", "模糊搜索动作库。同一关键词无结果时不要重复搜索，直接告知用户并建议用 manage_exercises 新增",
+    _fn("search_exercises", "模糊搜索动作库。多个动作名用逗号分隔一次批量查询(如'引体向上,划船,弯举')。同一关键词无结果时不要重复搜索，直接告知用户并建议新增",
         {"keyword": _str("关键词")}, ["keyword"]),
     _fn("web_search", "联网搜索(训练技术/营养/伤病康复/器材/时效性问题用)。返回标题/链接/摘要并自动在画布展示来源",
         {"query": _str("搜索关键词"), "max_results": _num("条数，默认5，最多8")}, ["query"]),
