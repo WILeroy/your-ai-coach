@@ -7,6 +7,7 @@
 - 确认/取消关键词仅在存在 pending action 时生效，避免误判
 """
 import json
+import re
 from datetime import datetime
 from .config import AGENT_MAX_TOOL_ROUNDS, CHAT_HISTORY_LIMIT
 from .llm import is_available, chat_stream, chat
@@ -17,6 +18,15 @@ from .tools import (TOOL_SCHEMAS, TOOL_MAP, store_pending, get_pending,
 CONFIRM_WORDS = {"确认", "yes", "ok", "好的", "可以", "执行", "confirm", "y",
                  "确定", "确认执行", "确认一下"}
 CANCEL_WORDS = {"取消", "no", "否", "算了", "cancel", "n", "不要", "不执行"}
+
+# 写入意图检测(完成时态/记录类动词)，用于 flash 模型漏调写工具时的纠正
+_WRITE_INTENT_RE = re.compile(
+    r"练完|做完|做[了完]\d|完成了|记录|记一下|记了|睡了\s*\d|睡\s*\d+\s*小时|体重\s*\d|晨脉\s*\d"
+    r"|生成.{0,6}周期|删除|删掉|改成|调整.{0,6}计划")
+_WRITE_TOOLS = {"log_training", "log_body_metric", "update_session", "delete_data",
+                "create_plan", "adjust_plan", "manage_exercises"}
+_WRITE_NUDGE = ("(系统提示: 检测到用户想记录/写入数据，但你尚未调用写入工具。"
+                "请立即调用相应的写入工具(不带confirmed参数)生成预览，不要只用文字描述。)")
 
 
 def handle_message(user_text, session_id=''):
@@ -52,7 +62,7 @@ def handle_message(user_text, session_id=''):
 
 # ═══════════════ Agent 主循环 ═══════════════
 
-def _agent_loop(messages, tool_calls_log, session_id, user_text):
+def _agent_loop(messages, tool_calls_log, session_id, user_text, _retryed=False):
     """流式输出 -> 工具调用 -> 继续循环; 最后一轮禁用工具强制总结"""
     accumulated_content = ""
 
@@ -154,6 +164,14 @@ def _agent_loop(messages, tool_calls_log, session_id, user_text):
     # ── 空回复兜底 ──
     if not accumulated_content.strip():
         accumulated_content = _summarize_fallback(messages, tool_calls_log)
+
+    # ── 写入意图纠正: 模型漏调写工具时补一轮 ──
+    if (not _retryed and accumulated_content.strip()
+            and _WRITE_INTENT_RE.search(user_text or "")
+            and not any(t.get("tool") in _WRITE_TOOLS for t in tool_calls_log)):
+        messages.append({"role": "user", "content": _WRITE_NUDGE})
+        yield from _agent_loop(messages, tool_calls_log, session_id, user_text, _retryed=True)
+        return
 
     reply = accumulated_content or "(出错了，请重试)"
     _save_history(session_id, user_text, reply, tool_calls_log)

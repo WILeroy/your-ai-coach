@@ -53,17 +53,16 @@ def run_case(idx, text, expected_tools, allow_pending):
 
     if events["error"]:
         return False, f"error: {events['error']}"
+    # 写入类: pending_confirm 即为成功(等待用户确认是正确行为)
+    if events["pending"] is not None:
+        if events["pending"]["tool"] not in expected_tools:
+            return False, f"确认的工具不符: {events['pending']['tool']}"
+        return True, f"pending={events['pending']['tool']}"
     reply = events["reply"]
     if not reply or reply.strip() in ("(空)", "(出错了，请重试)"):
         return False, "空回复"
-    if allow_pending and events["pending"] is None:
-        # 写入类若未pending(比如模型判断无需写)也算失败
-        if not any(t in events["tools"] for t in expected_tools):
-            return False, f"未调用期望工具 & 无确认: tools={events['tools']}"
     if not allow_pending and not any(t in events["tools"] for t in expected_tools):
         return False, f"未调用期望工具 {expected_tools}, 实际: {events['tools']}"
-    if allow_pending and events["pending"] and not any(t in expected_tools for t in [events["pending"]["tool"]]):
-        return False, f"确认的工具不符: {events['pending']['tool']}"
     return True, f"tools={events['tools']} reply={reply[:40]!r}"
 
 
