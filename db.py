@@ -98,6 +98,26 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_session ON chat_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at);
+
+CREATE TABLE IF NOT EXISTS agent_pending_actions (
+    action_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    messages_json TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_apa_session ON agent_pending_actions(session_id);
+CREATE INDEX IF NOT EXISTS idx_apa_expires ON agent_pending_actions(expires_at);
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+    ip TEXT PRIMARY KEY,
+    fails INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT,
+    updated_at TEXT
+);
 """
 
 def init_db():
@@ -105,6 +125,24 @@ def init_db():
     conn.executescript(SCHEMA)
     conn.commit()
     conn.close()
+
+def backup_db_if_new_day():
+    """每日首次调用时备份数据库（幂等）。"""
+    import shutil, glob
+    from datetime import datetime
+    today = datetime.now().strftime("%Y%m%d")
+    marker = os.path.join(os.path.dirname(DB_PATH), f'.backup-{today}')
+    if os.path.exists(marker):
+        return
+    existing = glob.glob(os.path.join(os.path.dirname(DB_PATH), f'fitness.db.bak-{datetime.now().strftime("%Y%m%d")}*'))
+    if existing:
+        open(marker, 'w').close()
+        return
+    try:
+        shutil.copy2(DB_PATH, os.path.join(os.path.dirname(DB_PATH), f'fitness.db.bak-{today}'))
+        open(marker, 'w').close()
+    except Exception:
+        pass
 
 def exercises_map():
     """返回 {name: id} 映射"""

@@ -1,224 +1,473 @@
-"""Agent 工具层: 1个开放SQL读工具 + 9个安全写工具(含确认机制)"""
-import sys, os, json, uuid, time
+"""Agent 工具层 v2: 结构化读写工具 + view_spec 可视化协议
+
+设计原则:
+- 读工具: 窄参数、强类型，返回数据 + view_spec(前端自动渲染图表)
+- 写工具: 一律确认门控 (preview -> 用户确认 -> confirmed=true 执行)
+- 确认状态持久化到 SQLite (agent_pending_actions)，多 worker 安全
+"""
+import sys, os, json, uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from datetime import datetime, timedelta, date
 from db import (get_db, get_session_detail, exercises_map, upsert_session,
-                 merge_session_sets, upsert_cardio, get_latest_cycle)
-from analytics import (compute_e1rm_history, compute_acwr, compute_adherence,
-                        get_deload_triggers, weekly_summary, epley_e1rm)
-from agent.safety import validate_select_sql, add_limit
+                merge_session_sets, upsert_cardio, get_latest_cycle,
+                backup_db_if_new_day)
+from analytics import (compute_e1rm_history, compute_volume_trend, compute_acwr,
+                        detect_plateaus, compute_adherence, get_deload_triggers,
+                        running_economy_trend, epley_e1rm)
 
-# ── 确认状态管理(内存) ──
-_pending_actions = {}
-
-def store_pending(action_id, tool_name, args, context):
-    _pending_actions[action_id] = {
-        "tool_name": tool_name, "args": args, "context": context,
-        "created_at": time.time()
-    }
-
-def get_pending(action_id):
-    return _pending_actions.pop(action_id, None)
-
-def cleanup_expired(max_age=300):
-    now = time.time()
-    expired = [k for k, v in _pending_actions.items() if now - v["created_at"] > max_age]
-    for k in expired:
-        del _pending_actions[k]
+WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+PENDING_EXPIRE_MINUTES = 10
 
 
-# ═══════════════════════════════════════════════
-# 读工具
-# ═══════════════════════════════════════════════
+# ============================================================
+# 确认状态管理 (SQLite 持久化, 多 worker 安全)
+# ============================================================
 
-def tool_db_query(query, limit=None, **kwargs):
-    """执行只读 SQL SELECT 查询"""
-    ok, err = validate_select_sql(query)
-    if not ok:
-        return {"error": err, "hint": "仅允许 SELECT 查询，如需要写入请使用对应工具"}
-
-    limit = limit or 50
-    limit = min(max(limit, 1), 200)
-    query = add_limit(query, default_limit=limit, max_limit=200)
-
-    try:
-        conn = get_db()
-        cur = conn.execute(query)
-        columns = [d[0] for d in cur.description] if cur.description else []
-        rows_raw = cur.fetchall()
-        if not rows_raw:
-            conn.close()
-            return {"columns": columns, "rows": [], "row_count": 0, "truncated": False,
-                    "query": query[:200]}
-
-        rows = [dict(zip(columns, row)) for row in rows_raw]
-
-        # 截断过长结果
-        truncated = len(rows) > limit
-        if truncated:
-            rows = rows[:limit]
-
-        # 移除内部字段
-        for row in rows:
-            for k in list(row.keys()):
-                if k.startswith('_'):
-                    del row[k]
-
-        conn.close()
-        return {
-            "columns": columns,
-            "rows": rows,
-            "row_count": len(rows),
-            "truncated": truncated,
-            "query": query[:200]
-        }
-    except Exception as e:
-        return {"error": str(e), "hint": "SQL 执行出错，请检查语法"}
-
-
-def tool_get_db_schema(**kwargs):
-    """获取数据库完整 schema 供 LLM 理解数据结构"""
+def store_pending(action_id, tool_name, args, session_id, tool_call_id, messages):
     conn = get_db()
-    tables = []
-    table_rows = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-    ).fetchall()
-    for tr in table_rows:
-        tname = tr['name']
-        cols = conn.execute(f"PRAGMA table_info('{tname}')").fetchall()
-        columns = [{"name": c['name'], "type": c['type'],
-                     "pk": bool(c['pk']), "notnull": bool(c['notnull'])} for c in cols]
-        indexes = conn.execute(f"PRAGMA index_list('{tname}')").fetchall()
-        idx_list = [{"name": i['name'], "unique": bool(i['unique'])} for i in indexes]
-        tables.append({"name": tname, "columns": columns, "indexes": idx_list})
-
-    # 元数据摘要
-    stats = {
-        "exercises": conn.execute("SELECT COUNT(*) FROM exercises").fetchone()[0],
-        "cycles": conn.execute("SELECT COUNT(*) FROM cycles").fetchone()[0],
-        "sessions": conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
-        "sets": conn.execute("SELECT COUNT(*) FROM sets").fetchone()[0],
-        "cardio": conn.execute("SELECT COUNT(*) FROM cardio").fetchone()[0],
-        "body_metrics": conn.execute("SELECT COUNT(*) FROM body_metrics").fetchone()[0],
-    }
+    now = datetime.now()
+    conn.execute(
+        """INSERT OR REPLACE INTO agent_pending_actions
+           (action_id, session_id, messages_json, tool_name, args_json, tool_call_id, created_at, expires_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        [action_id, session_id, json.dumps(messages, ensure_ascii=False, default=str),
+         tool_name, json.dumps(args, ensure_ascii=False, default=str), tool_call_id,
+         now.isoformat(), (now + timedelta(minutes=PENDING_EXPIRE_MINUTES)).isoformat()])
+    conn.commit()
     conn.close()
-    return {"tables": tables, "stats": stats}
 
 
-# ═══════════════════════════════════════════════
-# 写工具 (含确认机制)
-# ═══════════════════════════════════════════════
+def get_pending(action_id=None, session_id=None):
+    """取出(并删除)一条 pending action; 按 action_id 或 session 最新一条"""
+    conn = get_db()
+    row = None
+    if action_id:
+        row = conn.execute("SELECT * FROM agent_pending_actions WHERE action_id=?",
+                           [action_id]).fetchone()
+    elif session_id:
+        row = conn.execute(
+            "SELECT * FROM agent_pending_actions WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+            [session_id]).fetchone()
+    if row:
+        conn.execute("DELETE FROM agent_pending_actions WHERE action_id=?", [row['action_id']])
+        conn.commit()
+    conn.close()
+    if not row:
+        return None
+    try:
+        if datetime.fromisoformat(row['expires_at']) < datetime.now():
+            return None
+    except Exception:
+        return None
+    d = dict(row)
+    d['messages'] = json.loads(d.pop('messages_json'))
+    d['args'] = json.loads(d.pop('args_json'))
+    return d
+
+
+def peek_pending_session(session_id):
+    """查看 session 是否有 pending(不删除)"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT expires_at FROM agent_pending_actions WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
+        [session_id]).fetchone()
+    conn.close()
+    if not row:
+        return False
+    try:
+        return datetime.fromisoformat(row['expires_at']) >= datetime.now()
+    except Exception:
+        return False
+
+
+def cleanup_expired():
+    conn = get_db()
+    conn.execute("DELETE FROM agent_pending_actions WHERE expires_at < ?",
+                 [datetime.now().isoformat()])
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# 通用辅助
+# ============================================================
+
+def _match_exercise(name):
+    """精确 -> 包含 匹配动作名。返回 (matched_name, candidates)"""
+    if not name:
+        return None, []
+    ex_map = exercises_map()
+    if name in ex_map:
+        return name, []
+    candidates = [k for k in ex_map if name in k or k in name]
+    if len(candidates) == 1:
+        return candidates[0], []
+    return None, candidates[:5]
+
 
 def _preview_or_execute(confirmed, build_preview, execute):
-    """通用确认流程: 未确认返回预览，已确认执行"""
+    """通用确认流程: 未确认返回预览，已确认执行(先备份)"""
     if not confirmed:
-        return {"status": "pending", "action_id": str(uuid.uuid4())[:8],
+        return {"status": "pending", "action_id": uuid.uuid4().hex[:8],
                 "preview": build_preview()}
     try:
+        backup_db_if_new_day()
         result = execute()
-        return {"status": "done", **result}
+        return {"status": "done", "ui_refresh": True, **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
 
-def tool_log_training(date, stype, sets=None, cardio=None, rpe=None,
-                      sleep_h=None, bodyweight=None, notes=None,
-                      confirmed=False, **kwargs):
-    """记录一次训练完成情况(需确认)"""
+def _weeks_ago(weeks):
+    return (date.today() - timedelta(days=weeks * 7)).isoformat()
+
+
+# ============================================================
+# 读工具 (免确认, 带 view_spec)
+# ============================================================
+
+def tool_get_today_context(**kwargs):
+    """今天日期/星期、当日计划配重、近7天完成状态、最新身体指标"""
+    today = date.today().isoformat()
+    conn = get_db()
+
+    today_sessions = conn.execute(
+        "SELECT * FROM sessions WHERE date=? ORDER BY type", [today]).fetchall()
+    today_list = []
+    for s in today_sessions:
+        s = dict(s)
+        sets_rows = conn.execute("""
+            SELECT st.*, e.name as exercise_name FROM sets st
+            JOIN exercises e ON st.exercise_id=e.id WHERE st.session_id=?
+            ORDER BY st.set_no""", [s['id']]).fetchall()
+        by_ex = {}
+        for st in sets_rows:
+            n = st['exercise_name']
+            by_ex.setdefault(n, [])
+            by_ex[n].append({"set_no": st["set_no"],
+                             "planned": '%skg×%s' % (st["planned_kg"] or "?", st["planned_reps"] or "?"),
+                             "actual": ('%skg×%s' % (st["actual_kg"], st["actual_reps"])
+                                        if st["actual_kg"] is not None else None),
+                             "status": st["status"]})
+        s['exercises'] = by_ex
+        today_list.append(s)
+
+    week_rows = conn.execute(
+        """SELECT date, type, status, rpe FROM sessions
+           WHERE date >= date(?, '-6 days') AND date <= ? ORDER BY date""",
+        [today, today]).fetchall()
+    week_summary = [{"date": r['date'], "type": r['type'], "status": r['status'],
+                     "rpe": r['rpe']} for r in week_rows]
+
+    metric = conn.execute(
+        "SELECT date, weight, sleep_h, resting_hr FROM body_metrics ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    done_count = sum(1 for w in week_summary if w['status'] in ('done', 'partial'))
+    cards = [{"label": "近7天完成", "value": "%d/%d" % (done_count, len(week_summary)), "unit": "次"}]
+    if metric:
+        cards.append({"label": "体重(%s)" % metric['date'], "value": metric['weight'], "unit": "kg"})
+        cards.append({"label": "睡眠(%s)" % metric['date'], "value": metric['sleep_h'], "unit": "h"})
+
+    return {
+        "today": today,
+        "weekday": WEEKDAY_CN[date.today().weekday()],
+        "today_sessions": today_list,
+        "week": week_summary,
+        "latest_metric": dict(metric) if metric else None,
+        "view_spec": {"view": "metric_cards", "title": "今天 · %s" % today, "cards": cards},
+    }
+
+
+def tool_get_exercise_history(exercise, days=90, limit=50, **kwargs):
+    """某动作的训练历史 + e1RM 趋势"""
+    matched, candidates = _match_exercise(exercise)
+    if not matched:
+        return {"error": "未找到动作 '%s'" % exercise, "candidates": candidates,
+                "hint": "可用 search_exercises 查找正确名称"}
+    since = _weeks_ago(max(1, days // 7))
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT s.date, st.actual_kg, st.actual_reps, st.planned_kg, st.planned_reps, st.rpe, st.status
+        FROM sets st JOIN sessions s ON st.session_id=s.id
+        JOIN exercises e ON st.exercise_id=e.id
+        WHERE e.name=? AND s.date>=? AND st.status != 'skipped'
+        ORDER BY s.date DESC, st.set_no LIMIT ?""", [matched, since, int(limit)]).fetchall()
+    conn.close()
+
+    history = [dict(r) for r in rows]
+    best = {}
+    for h in history:
+        if h['actual_kg'] and h['actual_reps']:
+            erm = epley_e1rm(h['actual_kg'], h['actual_reps'])
+            if erm and (h['date'] not in best or erm > best[h['date']]['e1rm']):
+                best[h['date']] = {"e1rm": erm, "kg": h['actual_kg'], "reps": h['actual_reps']}
+    dates = sorted(best.keys())
+    series = [{"name": matched, "data": [best[d]['e1rm'] for d in dates]}]
+
+    return {
+        "exercise": matched,
+        "sets": history[::-1],
+        "e1rm_series": {d: best[d] for d in dates},
+        "view_spec": {"view": "line", "title": "%s e1RM 趋势" % matched,
+                      "x": dates, "series": series, "y_name": "kg"},
+    }
+
+
+def tool_get_sessions(date_from=None, date_to=None, type=None, status=None, limit=50, **kwargs):
+    """查询训练课列表"""
+    q = "SELECT * FROM sessions WHERE 1=1"
+    args = []
+    if date_from:
+        q += " AND date>=?"; args.append(date_from)
+    if date_to:
+        q += " AND date<=?"; args.append(date_to)
+    if type:
+        q += " AND type=?"; args.append(type)
+    if status:
+        q += " AND status=?"; args.append(status)
+    q += " ORDER BY date DESC LIMIT ?"; args.append(min(max(int(limit or 50), 1), 200))
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+    conn.close()
+
+    columns = [{"key": "date", "label": "日期"}, {"key": "type", "label": "类型"},
+               {"key": "status", "label": "状态"}, {"key": "rpe", "label": "RPE"},
+               {"key": "sleep_h", "label": "睡眠"}, {"key": "notes", "label": "备注"}]
+    return {"sessions": rows,
+            "view_spec": {"view": "table", "title": "训练课(%d条)" % len(rows),
+                          "columns": columns, "rows": rows[:50]}}
+
+
+ANALYTICS_KINDS = ("e1rm", "volume", "acwr", "plateau", "adherence", "deload", "running")
+
+
+def tool_get_analytics(kind, weeks=12, **kwargs):
+    """分析引擎: e1rm/volume/acwr/plateau/adherence/deload/running"""
+    if kind not in ANALYTICS_KINDS:
+        return {"error": "未知 kind: %s" % kind, "available": list(ANALYTICS_KINDS)}
+    weeks = min(max(int(weeks or 12), 1), 52)
+    since = _weeks_ago(weeks)
+
+    if kind == "e1rm":
+        hist = compute_e1rm_history()
+        items = sorted(hist.items(), key=lambda kv: -len(kv[1]))[:6]
+        all_dates = sorted({e['date'] for _, es in items for e in es if e['date'] >= since})
+        series = []
+        for name, entries in items:
+            m = {e['date']: e['e1rm'] for e in entries if e['date'] >= since}
+            series.append({"name": name, "data": [m.get(d) for d in all_dates]})
+        return {"data": {n: [e for e in entries if e["date"] >= since] for n, entries in items},
+                "view_spec": {"view": "line", "title": "e1RM 趋势", "x": all_dates,
+                              "series": series, "y_name": "kg", "connect_nulls": True}}
+
+    if kind == "volume":
+        vol = compute_volume_trend()
+        weeks_list = list(vol.keys())[-weeks:]
+        patterns = ["squat", "hinge", "push", "pull", "core", "other"]
+        series = [{"name": p, "data": [vol[w].get(p, 0) for w in weeks_list]}
+                  for p in patterns if any(vol[w].get(p, 0) > 0 for w in weeks_list)]
+        return {"data": {w: vol[w] for w in weeks_list},
+                "view_spec": {"view": "bar", "title": "周容量吨位", "x": weeks_list,
+                              "series": series, "y_name": "kg", "stack": True}}
+
+    if kind == "acwr":
+        hist = [h for h in compute_acwr() if h['date'] >= since]
+        return {"data": hist,
+                "view_spec": {"view": "line", "title": "ACWR 急慢性负荷比",
+                              "x": [h['date'] for h in hist],
+                              "series": [{"name": "ACWR", "data": [h['ratio'] for h in hist]}],
+                              "y_name": "ratio", "mark_line": 1.5}}
+
+    if kind == "plateau":
+        plateaus = detect_plateaus(compute_e1rm_history())
+        rows = [{"exercise": k, **v} for k, v in plateaus.items()]
+        columns = [{"key": "exercise", "label": "动作"}, {"key": "since_date", "label": "停滞自"},
+                   {"key": "current_e1rm", "label": "当前e1RM"}, {"key": "stale_count", "label": "连续无提升"}]
+        return {"data": plateaus,
+                "view_spec": {"view": "table", "title": "平台期检测", "columns": columns, "rows": rows}}
+
+    if kind == "adherence":
+        adh = compute_adherence()
+        rows = [{"exercise": k, "skipped": v} for k, v in adh.items()]
+        columns = [{"key": "exercise", "label": "动作"}, {"key": "skipped", "label": "跳过次数"}]
+        return {"data": adh,
+                "view_spec": {"view": "table", "title": "依从性(跳过统计)", "columns": columns, "rows": rows}}
+
+    if kind == "deload":
+        triggers = get_deload_triggers()
+        rows = [{"type": t['type'], "message": t['message']} for t in triggers]
+        columns = [{"key": "type", "label": "类型"}, {"key": "message", "label": "信号"}]
+        return {"data": triggers,
+                "view_spec": {"view": "table", "title": "减载触发信号", "columns": columns, "rows": rows}}
+
+    if kind == "running":
+        trend = [t for t in running_economy_trend() if t['date'] >= since]
+        return {"data": trend,
+                "view_spec": {"view": "line", "title": "LSD 配速趋势",
+                              "x": [t['date'] for t in trend],
+                              "series": [{"name": "配速", "data": [t['pace_sec'] for t in trend]}],
+                              "y_name": "sec/km"}}
+    return {"error": "unreachable"}
+
+
+def tool_get_plan(cycle="current", **kwargs):
+    """当前周期计划: 日历 + 目标 + 进度"""
+    conn = get_db()
+    if cycle == "current":
+        row = conn.execute("SELECT * FROM cycles ORDER BY start_date DESC LIMIT 1").fetchone()
+    else:
+        row = conn.execute("SELECT * FROM cycles WHERE id=?", [int(cycle)]).fetchone()
+    if not row:
+        conn.close()
+        return {"error": "没有周期数据，可用 create_plan 生成"}
+    c = dict(row)
+    sessions = [dict(s) for s in conn.execute(
+        "SELECT * FROM sessions WHERE cycle_id=? ORDER BY date", [c['id']]).fetchall()]
+    conn.close()
+    c['goals'] = json.loads(c.pop('goals_json') or '[]')
+    c.pop('notes', None)
+    erm = compute_e1rm_history()
+    goals = []
+    for g in c['goals']:
+        name = g.get('exercise')
+        latest = erm.get(name, [{}])[-1] if erm.get(name) else {}
+        goals.append(dict(g, current_e1rm=latest.get('e1rm')))
+    today = date.today().isoformat()
+    return {"cycle": c, "goals_progress": goals,
+            "sessions": [{"date": s['date'], "type": s['type'], "status": s['status']}
+                         for s in sessions],
+            "today_index": next((i for i, s in enumerate(sessions) if s['date'] >= today), None)}
+
+
+def tool_get_body_metrics(days=90, **kwargs):
+    """身体指标历史(体重/睡眠/晨脉)"""
+    since = _weeks_ago(max(1, days // 7))
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT date, weight, sleep_h, resting_hr FROM body_metrics WHERE date>=? ORDER BY date",
+        [since]).fetchall()]
+    conn.close()
+    x = [r['date'] for r in rows]
+    series = [{"name": "体重kg", "data": [r['weight'] for r in rows]},
+              {"name": "睡眠h", "data": [r['sleep_h'] for r in rows]},
+              {"name": "晨脉bpm", "data": [r['resting_hr'] for r in rows]}]
+    return {"metrics": rows,
+            "view_spec": {"view": "line", "title": "身体指标", "x": x, "series": series,
+                          "connect_nulls": True}}
+
+
+def tool_search_exercises(keyword, **kwargs):
+    """模糊搜索动作库"""
+    conn = get_db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT name, pattern, equipment, is_main FROM exercises WHERE name LIKE ? ORDER BY is_main DESC, name LIMIT 20",
+        ["%" + keyword + "%"]).fetchall()]
+    conn.close()
+    return {"results": rows}
+
+
+def tool_show_view(page, **kwargs):
+    """让前端切换页面: coach/dashboard/trends/review/plan"""
+    valid = {"coach", "dashboard", "trends", "review", "plan"}
+    if page not in valid:
+        return {"error": "未知页面 %s" % page, "available": sorted(valid)}
+    return {"status": "done", "view_spec": {"view": "navigate", "page": page}}
+
+
+# ============================================================
+# 写工具 (确认门控)
+# ============================================================
+
+def tool_log_training(date=None, stype=None, sets=None, cardio=None, rpe=None, sleep_h=None,
+                      bodyweight=None, notes=None, confirmed=False, **kwargs):
+    """记录一次训练"""
+    d = date or kwargs.get("date_") or datetime.now().strftime("%Y-%m-%d")
     sets = sets or []
-    cardio = cardio or {}
+    if not stype:
+        return {"error": "stype 必填: legs/push/pull/interval/lsd/relax"}
 
     def preview():
-        p = {"date": date, "type": stype, "rpe": rpe, "sleep_h": sleep_h,
+        p = {"date": d, "type": stype, "rpe": rpe, "sleep_h": sleep_h,
              "bodyweight": bodyweight, "notes": notes or ""}
         p["sets_summary"] = []
-        ex_map = exercises_map()
         for s in sets:
             ename = s.get("exercise", s.get("name", ""))
+            matched, candidates = _match_exercise(ename)
             kgs = []
             groups = s.get("groups") or ([s] if "kg" in s else [])
             for g in groups:
-                kgs.append(f"{g.get('kg','?')}kg×{g.get('reps','?')}")
-            p["sets_summary"].append({
-                "exercise": ename,
-                "groups": kgs,
-                "exists_in_db": ename in ex_map if ename else False
-            })
+                kgs.append("%skg×%s" % (g.get('kg', '?'), g.get('reps', '?')))
+            item = {"exercise": matched or ename, "groups": kgs, "exists_in_db": bool(matched)}
+            if candidates:
+                item["candidates"] = candidates
+            p["sets_summary"].append(item)
         if cardio and cardio.get("kind"):
-            p["cardio_summary"] = {"kind": cardio["kind"],
-                                    "distance_km": cardio.get("distance_km"),
-                                    "details": cardio.get("actual") and "有详细数据" or "无"}
+            p["cardio_summary"] = {"kind": cardio["kind"], "distance_km": cardio.get("distance_km")}
         return p
 
     def execute():
-        from datetime import datetime as dt
-        cycle = _detect_cycle(date)
-        cid = cycle['id'] if cycle else None
-        sid = upsert_session(date, cid, week_no=None, day_no=None, type_=stype,
+        cid = None
+        cycle = get_latest_cycle()
+        if cycle and cycle['start_date'] <= d <= cycle['end_date']:
+            cid = cycle['id']
+        sid = upsert_session(d, cid, None, None, stype,
                              sleep_h=sleep_h, bodyweight=bodyweight, rpe=rpe,
                              status="done", notes=notes or "")
         ex_map = exercises_map()
-        logged = []
+        logged, skipped = [], []
         payload = []
         for s in sets:
             ename = s.get("exercise", s.get("name", ""))
-            if not ename or ename not in ex_map:
-                logged.append({"error": f"动作 '{ename}' 不存在，已跳过"})
+            matched, _ = _match_exercise(ename)
+            if not matched:
+                skipped.append(ename)
                 continue
-            groups = s.get("groups")
-            if not groups and "kg" in s:
-                groups = [s]
+            groups = s.get("groups") or ([s] if "kg" in s else [])
             if not groups:
                 continue
-            payload.append({"exercise_id": ex_map[ename], "groups": groups})
+            payload.append({"exercise_id": ex_map[matched], "groups": groups})
             for g in groups:
-                logged.append({"exercise": ename, "kg": g.get("kg"), "reps": g.get("reps")})
+                logged.append({"exercise": matched, "kg": g.get("kg"), "reps": g.get("reps")})
         if payload:
             merge_session_sets(sid, payload)
         if cardio and cardio.get("kind") and (cardio.get("distance_km") or cardio.get("actual")):
-            import json as j
             upsert_cardio(sid, cardio["kind"],
-                          planned_json=j.dumps(cardio.get("planned", {})) if cardio.get("planned") else None,
-                          actual_json=j.dumps(cardio.get("actual", {})) if cardio.get("actual") else None,
+                          planned_json=json.dumps(cardio.get("planned", {}), ensure_ascii=False) if cardio.get("planned") else None,
+                          actual_json=json.dumps(cardio.get("actual", {}), ensure_ascii=False) if cardio.get("actual") else None,
                           distance_km=cardio.get("distance_km"),
                           avg_hr=cardio.get("avg_hr"), avg_pace_sec=cardio.get("avg_pace_sec"))
-        return {"session_id": sid, "date": date, "type": stype,
-                "logged_sets": logged, "cardio_logged": bool(cardio.get("kind"))}
+        result = {"session_id": sid, "date": d, "type": stype, "logged_sets": logged}
+        if skipped:
+            result["skipped_unknown_exercises"] = skipped
+        return result
 
     return _preview_or_execute(confirmed, preview, execute)
 
 
 def tool_update_session(session_id, changes=None, confirmed=False, **kwargs):
-    """修改已记录的训练数据(需确认)"""
+    """修改已记录的训练课字段(rpe/notes/sleep_h/date/type)"""
     changes = changes or {}
 
     def preview():
         old = get_session_detail(int(session_id))
         if not old:
-            return {"error": f"session {session_id} 不存在"}
-        _simplify_session(old)
-        preview_data = {"session_id": session_id, "old": old, "changes": changes}
-        if "sets" in changes:
-            preview_data["sets_count"] = len(changes["sets"])
-        if "cardio" in changes:
-            preview_data["cardio_change"] = True
-        return preview_data
+            return {"error": "session %s 不存在" % session_id}
+        old.pop('sets', None); old.pop('cardio', None)
+        return {"session_id": session_id, "old": old, "changes": changes}
 
     def execute():
         conn = get_db()
         sid = int(session_id)
-        if "date" in changes:
-            conn.execute("UPDATE sessions SET date=? WHERE id=?", [changes["date"], sid])
-        if "type" in changes:
-            conn.execute("UPDATE sessions SET type=? WHERE id=?", [changes["type"], sid])
-        if "rpe" in changes:
-            conn.execute("UPDATE sessions SET rpe=? WHERE id=?", [float(changes["rpe"]), sid])
-        if "sleep_h" in changes:
-            conn.execute("UPDATE sessions SET sleep_h=? WHERE id=?", [float(changes["sleep_h"]), sid])
-        if "bodyweight" in changes:
-            conn.execute("UPDATE sessions SET bodyweight=? WHERE id=?", [float(changes["bodyweight"]), sid])
-        if "notes" in changes:
-            conn.execute("UPDATE sessions SET notes=? WHERE id=?", [str(changes["notes"]), sid])
+        allowed = {"date": "date", "type": "type", "notes": "notes"}
+        numeric = {"rpe": float, "sleep_h": float, "bodyweight": float}
+        for k, v in changes.items():
+            if k in allowed:
+                conn.execute("UPDATE sessions SET %s=? WHERE id=?" % allowed[k], [v, sid])
+            elif k in numeric:
+                conn.execute("UPDATE sessions SET %s=? WHERE id=?" % k, [numeric[k](v), sid])
         conn.commit()
         conn.close()
         return {"session_id": session_id, "updated": list(changes.keys())}
@@ -227,48 +476,24 @@ def tool_update_session(session_id, changes=None, confirmed=False, **kwargs):
 
 
 def tool_delete_data(target, target_id, confirmed=False, **kwargs):
-    """删除训练数据(需确认)"""
+    """删除训练数据(session/set/cardio/exercise)"""
     valid = {"session", "set", "cardio", "exercise"}
     if target not in valid:
-        return {"error": f"不可删除的目标类型: {target}，可选: {valid}"}
+        return {"error": "不可删除: %s，可选: %s" % (target, valid)}
 
     def preview():
         conn = get_db()
-        if target == "session":
-            row = conn.execute("SELECT id, date, type, status FROM sessions WHERE id=?", [target_id]).fetchone()
-            conn.close()
-            if not row:
-                return {"error": f"session {target_id} 不存在"}
-            return {"target": "session", "id": target_id, "data": dict(row), "cascade": "同时删除关联的set和cardio记录"}
-        elif target == "set":
-            row = conn.execute("SELECT st.*, e.name as ex_name FROM sets st JOIN exercises e ON st.exercise_id=e.id WHERE st.id=?", [target_id]).fetchone()
-            conn.close()
-            if not row:
-                return {"error": f"set {target_id} 不存在"}
-            return {"target": "set", "id": target_id, "data": dict(row)}
-        elif target == "cardio":
-            row = conn.execute("SELECT * FROM cardio WHERE id=?", [target_id]).fetchone()
-            conn.close()
-            if not row:
-                return {"error": f"cardio {target_id} 不存在"}
-            return {"target": "cardio", "id": target_id, "data": dict(row)}
-        elif target == "exercise":
-            row = conn.execute("SELECT * FROM exercises WHERE id=?", [target_id]).fetchone()
-            conn.close()
-            if not row:
-                return {"error": f"exercise {target_id} 不存在"}
-            return {"target": "exercise", "id": target_id, "data": dict(row), "warning": "删除动作会级联删除所有关联set记录"}
+        table = {"session": "sessions", "set": "sets", "cardio": "cardio", "exercise": "exercises"}[target]
+        row = conn.execute("SELECT * FROM %s WHERE id=?" % table, [target_id]).fetchone()
+        conn.close()
+        if not row:
+            return {"error": "%s %s 不存在" % (target, target_id)}
+        return {"target": target, "target_id": target_id, "data": dict(row)}
 
     def execute():
         conn = get_db()
-        if target == "session":
-            conn.execute("DELETE FROM sessions WHERE id=?", [target_id])
-        elif target == "set":
-            conn.execute("DELETE FROM sets WHERE id=?", [target_id])
-        elif target == "cardio":
-            conn.execute("DELETE FROM cardio WHERE id=?", [target_id])
-        elif target == "exercise":
-            conn.execute("DELETE FROM exercises WHERE id=?", [target_id])
+        table = {"session": "sessions", "set": "sets", "cardio": "cardio", "exercise": "exercises"}[target]
+        conn.execute("DELETE FROM %s WHERE id=?" % table, [target_id])
         conn.commit()
         conn.close()
         return {"deleted": target, "id": target_id}
@@ -276,80 +501,20 @@ def tool_delete_data(target, target_id, confirmed=False, **kwargs):
     return _preview_or_execute(confirmed, preview, execute)
 
 
-def tool_adjust_plan(date, changes, confirmed=False, **kwargs):
-    """调整未来某天训练计划(需确认)"""
-    changes = changes or []
-
-    def preview():
-        conn = get_db()
-        row = conn.execute("SELECT id, date, type, status FROM sessions WHERE date=? AND status='planned'", [date]).fetchone()
-        ex_map = exercises_map()
-        if not row:
-            conn.close()
-            return {"error": f"{date} 没有可调整的计划"}
-
-        # 显示当前计划
-        cur_sets = conn.execute(
-            "SELECT st.*, e.name as ename FROM sets st JOIN exercises e ON st.exercise_id=e.id WHERE st.session_id=? ORDER BY st.set_no",
-            [row['id']]).fetchall()
-        current = [{"exercise": s['ename'], "set_no": s['set_no'],
-                     "planned_kg": s['planned_kg'], "planned_reps": s['planned_reps']} for s in cur_sets]
-        conn.close()
-
-        planned_changes = []
-        for ch in changes:
-            ename = ch.get("exercise")
-            groups = ch.get("groups", [ch])
-            planned_changes.append({
-                "exercise": ename,
-                "exists": ename in ex_map,
-                "groups": [{"kg": g.get("kg"), "reps": g.get("reps")} for g in groups]
-            })
-        return {"date": date, "current_plan": current, "new_plan": planned_changes}
-
-    def execute():
-        conn = get_db()
-        row = conn.execute("SELECT id FROM sessions WHERE date=? AND status='planned'", [date]).fetchone()
-        if not row:
-            conn.close()
-            return {"error": f"{date} 没有可调整的计划"}
-        sid = row['id']
-        ex_map = exercises_map()
-        adjusted = []
-        for ch in changes:
-            ename = ch.get("exercise")
-            if ename not in ex_map:
-                continue
-            eid = ex_map[ename]
-            conn.execute("DELETE FROM sets WHERE session_id=? AND exercise_id=?", [sid, eid])
-            for i, g in enumerate(ch.get("groups", [ch]), 1):
-                conn.execute(
-                    "INSERT INTO sets(session_id,exercise_id,set_no,planned_kg,planned_reps,status) VALUES(?,?,?,?,?,'planned')",
-                    [sid, eid, i, g.get("kg"), g.get("reps")])
-                adjusted.append({"exercise": ename, "kg": g.get("kg"), "reps": g.get("reps"), "set": i})
-        conn.commit()
-        conn.close()
-        return {"date": date, "adjusted": adjusted}
-
-    return _preview_or_execute(confirmed, preview, execute)
-
-
-def tool_generate_cycle(start_date, weeks=4, template="standard", confirmed=False, **kwargs):
-    """生成训练周期计划(需确认落库)"""
-    from datetime import datetime, timedelta
+def tool_create_plan(start_date, weeks=4, template="standard", goals=None,
+                     confirmed=False, **kwargs):
+    """生成训练周期计划"""
     from planner import build_cycle_template
+    goals = goals or []
 
     def preview():
         days = build_cycle_template(start_date, int(weeks), template)
-        # 按周分组预览
-        weeks_preview = {}
-        for d in days:
-            wk = d.get('week_no', 1)
-            if wk not in weeks_preview:
-                weeks_preview[wk] = []
-            weeks_preview[wk].append({"date": d['date'], "type": d['type'], "phase": d['phase']})
+        by_week = {}
+        for dd in days:
+            by_week.setdefault(dd.get('week_no', 1), []).append(
+                {"date": dd['date'], "type": dd['type']})
         return {"start_date": start_date, "weeks": weeks, "template": template,
-                "days_count": len(days), "schedule": weeks_preview}
+                "goals": goals, "schedule": by_week}
 
     def execute():
         from db import insert_session, insert_cycle
@@ -357,29 +522,28 @@ def tool_generate_cycle(start_date, weeks=4, template="standard", confirmed=Fals
         if not days:
             return {"error": "生成计划为空"}
         end_date = days[-1]['date']
-        cid = insert_cycle(start_date, end_date, template, '[]', '')
+        cid = insert_cycle(start_date, end_date, template,
+                           json.dumps(goals, ensure_ascii=False), '')
         ex_map = exercises_map()
-        for d in days:
-            sid = insert_session(d['date'], cid, d.get('week_no'), d.get('day_no'),
-                                 d['type'], status='planned')
-            if d['type'] in ('push', 'pull', 'legs'):
-                _create_stock_sets(sid, d['type'], ex_map)
+        for dd in days:
+            sid = insert_session(dd['date'], cid, dd.get('week_no'), dd.get('day_no'),
+                                 dd['type'], status='planned')
+            if dd['type'] in ('push', 'pull', 'legs'):
+                _create_stock_sets(sid, dd['type'], ex_map)
         return {"cycle_id": cid, "start_date": start_date, "end_date": end_date,
-                "days_count": len(days), "weeks": weeks}
+                "days_count": len(days)}
 
     return _preview_or_execute(confirmed, preview, execute)
 
 
 def _create_stock_sets(session_id, session_type, ex_map):
-    """为训练日创建默认动作组"""
     stock = {
         "push": ["杠铃卧推", "哑铃推举", "哑铃飞鸟", "三头臂屈伸"],
         "pull": ["传统硬拉", "杠铃划船", "引体向上", "哑铃弯举"],
         "legs": ["杠铃深蹲", "罗马尼亚硬拉", "保加利亚分腿蹲", "腿弯举"],
     }
-    exercises = stock.get(session_type, [])
     conn = get_db()
-    for i, ename in enumerate(exercises, 1):
+    for i, ename in enumerate(stock.get(session_type, []), 1):
         eid = ex_map.get(ename)
         if not eid:
             continue
@@ -390,9 +554,72 @@ def _create_stock_sets(session_id, session_type, ex_map):
     conn.close()
 
 
+def tool_adjust_plan(date=None, changes=None, confirmed=False, **kwargs):
+    """调整某天计划的动作组"""
+    d = date or kwargs.get("date_")
+    changes = changes or []
+
+    def preview():
+        conn = get_db()
+        row = conn.execute("SELECT id FROM sessions WHERE date=? AND status='planned'",
+                           [d]).fetchone()
+        if not row:
+            conn.close()
+            return {"error": "%s 没有可调整的计划" % d}
+        current = [dict(r) for r in conn.execute("""
+            SELECT e.name, st.planned_kg, st.planned_reps FROM sets st
+            JOIN exercises e ON st.exercise_id=e.id WHERE st.session_id=?""", [row['id']]).fetchall()]
+        conn.close()
+        return {"date": d, "current": current, "new": changes}
+
+    def execute():
+        conn = get_db()
+        row = conn.execute("SELECT id FROM sessions WHERE date=? AND status='planned'",
+                           [d]).fetchone()
+        if not row:
+            conn.close()
+            return {"error": "%s 没有可调整的计划" % d}
+        sid = row['id']
+        ex_map = exercises_map()
+        adjusted = []
+        for ch in changes:
+            matched, _ = _match_exercise(ch.get("exercise", ""))
+            if not matched:
+                continue
+            eid = ex_map[matched]
+            conn.execute("DELETE FROM sets WHERE session_id=? AND exercise_id=?", [sid, eid])
+            for i, g in enumerate(ch.get("groups", [ch]), 1):
+                conn.execute(
+                    "INSERT INTO sets(session_id,exercise_id,set_no,planned_kg,planned_reps,status) VALUES(?,?,?,?,?,'planned')",
+                    [sid, eid, i, g.get("kg"), g.get("reps")])
+                adjusted.append({"exercise": matched, "kg": g.get("kg"), "reps": g.get("reps")})
+        conn.commit()
+        conn.close()
+        return {"date": d, "adjusted": adjusted}
+
+    return _preview_or_execute(confirmed, preview, execute)
+
+
+def tool_log_body_metric(date=None, weight=None, sleep_h=None, resting_hr=None,
+                         notes=None, confirmed=False, **kwargs):
+    """记录身体指标"""
+    d = date or kwargs.get("date_") or datetime.now().strftime("%Y-%m-%d")
+
+    def preview():
+        return {"date": d, "weight": weight, "sleep_h": sleep_h,
+                "resting_hr": resting_hr, "notes": notes}
+
+    def execute():
+        from db import insert_body_metric
+        insert_body_metric(d, weight, sleep_h, resting_hr, notes or "")
+        return {"date": d, "saved": True}
+
+    return _preview_or_execute(confirmed, preview, execute)
+
+
 def tool_manage_exercises(action, name, pattern=None, equipment=None, is_main=0,
                           notes=None, confirmed=False, **kwargs):
-    """管理动作库: 添加/更新动作(需确认)"""
+    """动作库管理: add/update"""
     if action not in ("add", "update"):
         return {"error": "action 必须是 add 或 update"}
 
@@ -400,253 +627,119 @@ def tool_manage_exercises(action, name, pattern=None, equipment=None, is_main=0,
         ex_map = exercises_map()
         existing = name in ex_map
         if action == "add" and existing:
-            return {"error": f"动作 '{name}' 已存在，请用 update"}
+            return {"error": "动作 '%s' 已存在" % name}
         if action == "update" and not existing:
-            return {"error": f"动作 '{name}' 不存在，请用 add"}
+            return {"error": "动作 '%s' 不存在" % name}
         return {"action": action, "name": name, "pattern": pattern, "equipment": equipment,
-                "is_main": bool(is_main), "notes": notes}
+                "is_main": bool(is_main)}
 
     def execute():
+        conn = get_db()
         if action == "add":
-            conn = get_db()
-            conn.execute(
-                "INSERT INTO exercises(name,pattern,equipment,is_main,notes) VALUES(?,?,?,?,?)",
-                [name, pattern or "accessory", equipment, int(is_main) if is_main else 0, notes or ""])
-            conn.commit()
-            eid = conn.execute("SELECT id FROM exercises WHERE name=?", [name]).fetchone()['id']
-            conn.close()
-            return {"action": "add", "name": name, "id": eid}
+            conn.execute("INSERT INTO exercises(name,pattern,equipment,is_main,notes) VALUES(?,?,?,?,?)",
+                         [name, pattern or "accessory", equipment, int(bool(is_main)), notes or ""])
         else:
-            conn = get_db()
-            sets = []
-            vals = []
-            if pattern:
-                sets.append("pattern=?")
-                vals.append(pattern)
-            if equipment:
-                sets.append("equipment=?")
-                vals.append(equipment)
-            if is_main is not None:
-                sets.append("is_main=?")
-                vals.append(int(is_main))
-            if notes is not None:
-                sets.append("notes=?")
-                vals.append(notes)
-            if sets:
-                vals.append(name)
-                conn.execute(f"UPDATE exercises SET {', '.join(sets)} WHERE name=?", vals)
-                conn.commit()
-            conn.close()
-            return {"action": "update", "name": name, "updated_fields": [s.split("=")[0] for s in sets]}
-
-    return _preview_or_execute(confirmed, preview, execute)
-
-
-def tool_manage_profile(key, value, confirmed=False, **kwargs):
-    """修改用户档案/配置(需确认)"""
-    if not key:
-        return {"error": "key 不能为空"}
-
-    def preview():
-        conn = get_db()
-        row = conn.execute("SELECT value FROM profile WHERE key=?", [key]).fetchone()
-        old_val = row['value'] if row else None
-        new_val = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-        conn.close()
-        return {"key": key, "old_value": old_val, "new_value": str(value)}
-
-    def execute():
-        conn = get_db()
-        val_str = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
-        conn.execute("INSERT OR REPLACE INTO profile(key, value) VALUES(?,?)", [key, val_str])
+            conn.execute("""UPDATE exercises SET pattern=COALESCE(?,pattern),
+                            equipment=COALESCE(?,equipment), is_main=COALESCE(?,is_main),
+                            notes=COALESCE(?,notes) WHERE name=?""",
+                         [pattern, equipment, int(bool(is_main)) if is_main else None, notes, name])
         conn.commit()
         conn.close()
-        return {"key": key, "value": str(value)}
+        return {"action": action, "name": name}
 
     return _preview_or_execute(confirmed, preview, execute)
 
 
-def tool_log_body_metric(date, weight=None, sleep_h=None, resting_hr=None,
-                          notes="", confirmed=False, **kwargs):
-    """记录身体指标(需确认)"""
-    def preview():
-        return {"date": date, "weight": weight, "sleep_h": sleep_h,
-                "resting_hr": resting_hr, "notes": notes}
+# ============================================================
+# OpenAI 工具 schema
+# ============================================================
 
-    def execute():
-        from db import insert_body_metric
-        insert_body_metric(date, weight, sleep_h, resting_hr, notes)
-        return {"date": date, "recorded": True}
-
-    return _preview_or_execute(confirmed, preview, execute)
+def _fn(name, desc, params=None, required=None):
+    p = {"type": "object", "properties": params or {}}
+    if required:
+        p["required"] = required
+    return {"type": "function", "function": {"name": name, "description": desc, "parameters": p}}
 
 
-# ═══════════════════════════════════════════════
-# 内部辅助
-# ═══════════════════════════════════════════════
-
-def _detect_cycle(date):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM cycles WHERE ? BETWEEN start_date AND end_date", [date]).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-def _simplify_session(s):
-    return {
-        "id": s.get('id'), "date": s.get('date'), "type": s.get('type'),
-        "status": s.get('status'), "rpe": s.get('rpe'), "notes": s.get('notes'),
-        "sets": [{"exercise": st.get('exercise_name'), "planned_kg": st.get('planned_kg'),
-                   "planned_reps": st.get('planned_reps'), "status": st.get('status')}
-                  for st in (s.get('sets') or [])],
-        "cardio": s.get('cardio')
-    }
+def _str(desc, **kw):
+    d = {"type": "string", "description": desc}; d.update(kw); return d
 
 
-# ═══════════════════════════════════════════════
-# OpenAI function schemas
-# ═══════════════════════════════════════════════
+def _num(desc, **kw):
+    d = {"type": "number", "description": desc}; d.update(kw); return d
+
+
+_GROUPS = {"type": "array", "items": {"type": "object", "properties": {
+    "kg": _num("重量kg"), "reps": _num("次数")}}}
 
 TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "db_query",
-            "description": "执行只读SQL SELECT查询，自由检索训练数据。可查询所有表：sessions(训练课), sets(组数据), exercises(动作库), cycles(周期), cardio(跑步), body_metrics(身体指标), profile(用户配置)",
-            "parameters": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "SELECT SQL查询语句，需要用表连接时通过 sessions.id = sets.session_id 和 sets.exercise_id = exercises.id 关联"},
-                "limit": {"type": "integer", "description": "返回行数上限，默认50，最大200"}
-            }, "required": ["query"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_db_schema",
-            "description": "获取数据库完整表结构和统计信息",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "log_training",
-            "description": "记录一次训练完成情况。需要用户确认后才执行写入。",
-            "parameters": {"type": "object", "properties": {
-                "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
-                "stype": {"type": "string", "description": "训练类型: legs/push/pull/interval/lsd/relax/rest"},
-                "sets": {"type": "array", "items": {"type": "object"}, "description": "训练组数组，每项: {exercise:动作名, groups:[{kg, reps, rpe}]}"},
-                "cardio": {"type": "object", "description": "跑步数据 {kind, distance_km, actual:{intervals:[{m, pace_sec}]}}"},
-                "rpe": {"type": "number", "description": "整体RPE 1-10"},
-                "sleep_h": {"type": "number", "description": "前一晚睡眠小时数"},
-                "bodyweight": {"type": "number", "description": "体重kg"},
-                "notes": {"type": "string"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认，默认false"}
-            }, "required": ["date", "stype"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_session",
-            "description": "修改已记录的训练数据。需要用户确认后才执行。",
-            "parameters": {"type": "object", "properties": {
-                "session_id": {"type": "integer", "description": "要修改的session ID"},
-                "changes": {"type": "object", "description": "要修改的字段，如 {rpe:7, notes:'...', sleep_h:7.5}"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认"}
-            }, "required": ["session_id", "changes"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_data",
-            "description": "删除训练数据(session/set/cardio/exercise)。需要用户确认后才执行。",
-            "parameters": {"type": "object", "properties": {
-                "target": {"type": "string", "description": "目标类型: session/set/cardio/exercise"},
-                "target_id": {"type": "integer", "description": "要删除的记录ID"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认"}
-            }, "required": ["target", "target_id"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "adjust_plan",
-            "description": "调整未来某天的训练计划。需要用户确认后才执行。",
-            "parameters": {"type": "object", "properties": {
-                "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
-                "changes": {"type": "array", "items": {"type": "object"}, "description": "修改列表: [{exercise:动作名, groups:[{kg, reps}]}]"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认"}
-            }, "required": ["date", "changes"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_cycle",
-            "description": "生成并落库训练周期计划。需要用户确认后才执行。",
-            "parameters": {"type": "object", "properties": {
-                "start_date": {"type": "string", "description": "开始日期 YYYY-MM-DD"},
-                "weeks": {"type": "integer", "description": "周期周数，默认4"},
-                "template": {"type": "string", "description": "模板名，默认standard"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认"}
-            }, "required": ["start_date"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_exercises",
-            "description": "管理动作库。需要用户确认后才执行。",
-            "parameters": {"type": "object", "properties": {
-                "action": {"type": "string", "description": "add或update"},
-                "name": {"type": "string", "description": "动作名称"},
-                "pattern": {"type": "string", "description": "动作模式: squat/hinge/push/pull/core/accessory/stretch/cardio"},
-                "equipment": {"type": "string", "description": "器械: barbell/dumbbell/machine/bodyweight/cable"},
-                "is_main": {"type": "integer", "description": "是否为三大项核心动作(0/1)"},
-                "notes": {"type": "string"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认"}
-            }, "required": ["action", "name"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_profile",
-            "description": "修改用户档案配置。需要用户确认后才执行。",
-            "parameters": {"type": "object", "properties": {
-                "key": {"type": "string", "description": "配置键名"},
-                "value": {"type": "string", "description": "配置值(json可自动序列化)"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认"}
-            }, "required": ["key", "value"]}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "log_body_metric",
-            "description": "记录身体指标(体重/睡眠/晨脉)。需要用户确认后才执行。",
-            "parameters": {"type": "object", "properties": {
-                "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
-                "weight": {"type": "number", "description": "体重kg"},
-                "sleep_h": {"type": "number", "description": "睡眠小时数"},
-                "resting_hr": {"type": "integer", "description": "静息心率"},
-                "notes": {"type": "string"},
-                "confirmed": {"type": "boolean", "description": "用户是否已确认"}
-            }, "required": ["date"]}
-        }
-    },
+    _fn("get_today_context", "获取今天日期星期、当日训练计划与配重、近7天完成状态、最新身体指标。回答'今天练什么/今天状态'用它"),
+    _fn("get_exercise_history", "查某动作训练历史与e1RM趋势(自动渲染曲线)",
+        {"exercise": _str("动作名，如 杠铃卧推"), "days": _num("回看天数，默认90"), "limit": _num("最多组数，默认50")},
+        ["exercise"]),
+    _fn("get_sessions", "查询训练课列表",
+        {"date_from": _str("起始日期YYYY-MM-DD"), "date_to": _str("结束日期YYYY-MM-DD"),
+         "type": _str("legs/push/pull/interval/lsd/relax/rest"),
+         "status": _str("planned/done/partial/skipped"), "limit": _num("默认50")}),
+    _fn("get_analytics", "分析引擎。kind: e1rm(e1RM趋势) volume(周容量) acwr(负荷比) plateau(平台期) adherence(依从性) deload(减载信号) running(跑步配速)",
+        {"kind": _str("分析类型", enum=list(ANALYTICS_KINDS)), "weeks": _num("回看周数，默认12")},
+        ["kind"]),
+    _fn("get_plan", "查周期计划日历+目标进度", {"cycle": _str("current或周期ID，默认current")}),
+    _fn("get_body_metrics", "身体指标历史(体重/睡眠/晨脉)", {"days": _num("回看天数，默认90")}),
+    _fn("search_exercises", "模糊搜索动作库", {"keyword": _str("关键词")}, ["keyword"]),
+    _fn("show_view", "让用户界面切换页面", {"page": _str("页面", enum=["coach", "dashboard", "trends", "review", "plan"])}, ["page"]),
+    _fn("log_training", "记录一次训练(需确认)。sets每项:{exercise,groups:[{kg,reps}]}",
+        {"date": _str("日期YYYY-MM-DD，默认今天"), "stype": _str("类型: legs/push/pull/interval/lsd/relax"),
+         "sets": {"type": "array", "description": "动作组列表",
+                  "items": {"type": "object", "properties": {
+                      "exercise": _str("动作名"), "groups": _GROUPS}}},
+         "cardio": {"type": "object", "properties": {"kind": _str("interval/lsd"), "distance_km": _num("距离km"), "avg_hr": _num("平均心率"), "avg_pace_sec": _num("平均配速秒/km")}},
+         "rpe": _num("整体RPE 1-10"), "sleep_h": _num("睡眠小时"), "notes": _str("备注"),
+         "confirmed": {"type": "boolean", "description": "用户确认后为true"}},
+        ["stype"]),
+    _fn("update_session", "修改训练课字段(需确认)",
+        {"session_id": _num("session ID"), "changes": {"type": "object", "description": "{rpe,sleep_h,notes,date,type}子集"},
+         "confirmed": {"type": "boolean"}},
+        ["session_id", "changes"]),
+    _fn("delete_data", "删除数据(需确认)",
+        {"target": _str("session/set/cardio/exercise"), "target_id": _num("记录ID"),
+         "confirmed": {"type": "boolean"}}, ["target", "target_id"]),
+    _fn("create_plan", "生成训练周期计划(需确认)",
+        {"start_date": _str("开始日期YYYY-MM-DD"), "weeks": _num("周数，默认4"),
+         "template": _str("模板，默认standard"),
+         "goals": {"type": "array", "description": "目标列表", "items": {"type": "object", "properties": {
+             "exercise": _str("动作"), "from": _num("当前kg"), "to": _num("目标kg"),
+             "sets": _num("组数"), "reps": _num("次数")}}},
+         "confirmed": {"type": "boolean"}}, ["start_date"]),
+    _fn("adjust_plan", "调整某天计划的动作组(需确认)",
+        {"date": _str("日期YYYY-MM-DD"), "changes": {"type": "array", "items": {"type": "object", "properties": {
+            "exercise": _str("动作名"), "groups": _GROUPS}}},
+         "confirmed": {"type": "boolean"}}, ["date", "changes"]),
+    _fn("log_body_metric", "记录身体指标(需确认)",
+        {"date": _str("日期YYYY-MM-DD"), "weight": _num("体重kg"), "sleep_h": _num("睡眠h"),
+         "resting_hr": _num("晨脉bpm"), "confirmed": {"type": "boolean"}}, ["date"]),
+    _fn("manage_exercises", "动作库管理(需确认)",
+        {"action": _str("add或update"), "name": _str("动作名"), "pattern": _str("squat/hinge/push/pull/core/accessory/stretch/cardio"),
+         "equipment": _str("barbell/dumbbell/machine/bodyweight/cable"),
+         "is_main": _num("是否核心动作0/1"), "confirmed": {"type": "boolean"}},
+        ["action", "name"]),
 ]
 
+
 TOOL_MAP = {
-    "db_query": tool_db_query,
-    "get_db_schema": tool_get_db_schema,
+    "get_today_context": tool_get_today_context,
+    "get_exercise_history": tool_get_exercise_history,
+    "get_sessions": tool_get_sessions,
+    "get_analytics": tool_get_analytics,
+    "get_plan": tool_get_plan,
+    "get_body_metrics": tool_get_body_metrics,
+    "search_exercises": tool_search_exercises,
+    "show_view": tool_show_view,
     "log_training": tool_log_training,
     "update_session": tool_update_session,
     "delete_data": tool_delete_data,
+    "create_plan": tool_create_plan,
     "adjust_plan": tool_adjust_plan,
-    "generate_cycle": tool_generate_cycle,
-    "manage_exercises": tool_manage_exercises,
-    "manage_profile": tool_manage_profile,
     "log_body_metric": tool_log_body_metric,
+    "manage_exercises": tool_manage_exercises,
 }

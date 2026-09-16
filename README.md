@@ -1,109 +1,97 @@
-# Fitness Tracker · AI 体能教练
+# FIT · AI 体能教练 v2
 
-本地训练数据分析与计划系统，支持力量+跑步混合训练的全套运动科学追踪。
-现已集成 **AI 对话助手**（LLM Agent），支持自然语言录入训练与智能问答。
+以 **Agent 为核心**的本地训练助手：自然语言对话 → 工具调用 → 数据落库 → 可视化画布自动渲染。
 
-## 启动
+## 架构
 
-```bash
-cd ~/fitness-tracker
-source .venv/bin/activate
-python app.py
+```
+fit-ai-coach/
+├── app.py              # Flask: 认证 + SPA托管 + API + SSE
+├── auth.py             # 口令登录 + IP限速(SQLite持久化)
+├── db.py               # SQLite schema + 助手 (含每日自动备份)
+├── analytics.py        # 分析引擎 (e1RM/ACWR/平台期/依从性/减载)
+├── planner.py          # 周期计划生成
+├── agent/              # AI Agent
+│   ├── core.py         # Agent循环: 流式→工具→确认(SQLite持久化)→UI事件
+│   ├── tools.py        # 15个结构化工具 + view_spec可视化协议
+│   ├── context.py      # 精简系统提示词(~350 tokens, 含今日日期)
+│   ├── llm.py          # OpenAI兼容客户端(仅首token前重试)
+│   └── config.py       # .env 配置
+├── web/                # Vue3 + TS + Vite 前端
+│   └── src/pages/      # Coach(默认)/Dashboard/Trends/Review/Plan/Login
+├── scripts/agent_eval.py  # Agent回归评测
+├── tests/              # pytest 单元测试
+└── data/fitness.db     # 单文件数据库，拷贝即备份
 ```
 
-浏览器打开 **http://127.0.0.1:5100**
-
-## 功能
-
-| 页面 | 内容 |
-|---|---|
-| 仪表盘 | 当日训练卡、周历、三大项 e1RM、ACWR 负荷状态、减载建议 |
-| 趋势 | e1RM 历史曲线、周容量堆积图、ACWR 趋势、LSD 配速变化 |
-| 周报 | 自动化周度分析（依从性、平台期、负荷风险、下周校准） |
-| 周期计划 | 当前周期训练日历与验收目标 |
-| **AI助手** ✨ | 对话式训练录入、进展问答、计划查询、分析解读 |
-
-## AI 助手配置
-
-1. 获取 API Key：
-   - **Moonshot/Kimi**: https://platform.moonshot.cn（推荐，OpenAI 兼容）
-   - **DeepSeek**: https://platform.deepseek.com（更便宜，OpenAI 兼容）
-2. 将 `.env.template` 复制为 `.env`，填入 Key：
+## 部署
 
 ```bash
+# 1. 配置
 cp .env.template .env
-# 编辑 .env, 替换 LLM_API_KEY=sk-xxx
+# 编辑 .env: LLM_API_KEY / ACCESS_PASSWORD
+
+# 2. 构建前端
+cd web && npm install && npm run build && cd ..
+
+# 3. 启动 (systemd, 开机自启)
+./start.sh          # http://服务器IP:5200
 ```
 
-未配置 Key 时 Chat 页显示配置指引，其余功能不受影响。
+## 配置 (.env)
 
-### 对话示例
+| 键 | 默认 | 说明 |
+|---|---|---|
+| LLM_API_KEY | - | DeepSeek 或任意 OpenAI 兼容 Key |
+| LLM_BASE_URL | https://api.deepseek.com | |
+| LLM_MODEL | deepseek-flash | DeepSeek V4.1 Flash |
+| LLM_MAX_TOKENS | 2048 | |
+| AGENT_MAX_TOOL_ROUNDS | 6 | |
+| ACCESS_PASSWORD | - | Web 登录口令，必填 |
+
+## Agent 工作循环
 
 ```
-你: 今天练什么？
-FIT: 今日 7/22 周三 下肢训练: 硬拉 35kg 4×6(首项) / 深蹲 60kg 5×6
-     提踵 4×12-15（上次跳过，今天必做）
+用户: "深蹲趋势如何？"
+  → FIT 调用 get_exercise_history(深蹲)
+  → 工具返回数据 + view_spec
+  → 前端画布自动渲染 e1RM 曲线 (SSE "ui" 事件)
+  → FIT 输出文字解读
 
-你: 练完了，硬拉35kg做了4组6次，RPE大概7。深蹲60kg 5组6次最后一组有点沉。
-    昨晚睡了7小时。提踵做了4×15。
-FIT: 已记录 ✓ 硬拉首次全部完成，W3验收40kg稳了。
-     深蹲60全部达标，明天上肢推如果热身感觉沉可以跳过顶组。⚡
-
-你: 我卧推进展怎么样？
-FIT: 杠铃卧推当前 e1RM 49kg（7/16 35kg×12），比上次 +5.6kg↑
-     上周 40×6 已接近 W3 验收目标 40×5×5，进展良好。
+用户: "练完了，深蹲65kg 5×5"
+  → FIT 调用 log_training(预览)
+  → 前端弹出确认卡片
+  → 用户点"确认" → 落库 → 画布自动刷新
 ```
 
-## 数据录入
+- **读工具**(免确认): get_today_context / get_exercise_history / get_sessions / get_analytics / get_plan / get_body_metrics / search_exercises
+- **写工具**(确认门控): log_training / update_session / delete_data / create_plan / adjust_plan / log_body_metric / manage_exercises
+- 确认状态存 SQLite，gunicorn 多 worker 安全；10分钟过期
 
-三种方式：
+## 安全
 
-### 1. AI 对话（推荐）
-Chat 页直接说人话，Agent 自动解析落库。
+- 口令登录 + 会话Cookie (HttpOnly, SameSite=Lax)
+- 同IP 15分钟内 5 次登录失败锁定
+- 每日首次写入自动备份数据库到 data/fitness.db.bak-YYYYMMDD
+- 服务监听公网时，务必设置强口令；建议后续再加 HTTPS 反代
 
-### 2. CLI
+## 开发
+
 ```bash
-python cli.py log 2026-07-22 legs --rpe 7.5 --weight 76 --sleep 7
+# 后端 (5201测试端口)
+.venv/bin/python -c "import app; app.app.run(port=5201)"
+
+# 前端热更新 (5173, 代理到5200)
+cd web && npm run dev
+
+# 测试
+.venv/bin/python -m pytest tests/ -q
+.venv/bin/python scripts/agent_eval.py   # 需API Key
+```
+
+## CLI 数据录入
+
+```bash
+python cli.py log 2026-09-16 legs --rpe 8 --sleep 7
 python cli.py review
 ```
-
-### 3. API
-```bash
-curl -X POST http://127.0.0.1:5100/api/log -H "Content-Type: application/json" -d '{...}'
-```
-
-## 分析引擎
-
-- **e1RM** (Epley): kg × (1 + reps/30)，追踪三大项最佳组趋势
-- **容量吨位**: 按动作模式（蹲/铰链/推/拉/核心）周汇总
-- **ACWR**: 急慢性负荷比，sRPE 为统一单位（需 3-4 周数据）
-- **平台期**: 连续 3 次同动作 e1RM 未提升
-- **依从性**: 被跳过动作的出现模式
-- **减载触发**: e1RM 下滑 + RPE 升高 + ACWR 偏高 → 建议减载
-
-## 项目结构
-
-```
-fitness-tracker/
-├── app.py              # Flask 主应用 (15 API + 5 页面)
-├── db.py               # SQLite schema + 查询助手
-├── analytics.py        # 分析引擎 (e1RM/ACWR/平台期/依从性)
-├── planner.py          # 自动计划器 (渐进规则/周期生成)
-├── cli.py              # 命令行工具
-├── seed.py             # 种子数据迁移 (W1七天实际 + W2/W3计划)
-├── agent/              # AI Agent 模块
-│   ├── core.py         # Agent 循环 (理解→工具→回复→落库)
-│   ├── tools.py        # 9个确定性工具 + OpenAI schema
-│   ├── llm.py          # OpenAI兼容客户端
-│   ├── context.py      # 上下文注入 (档案/周期/分析/配重)
-│   └── config.py       # .env 配置
-├── templates/          # Jinja2 模板 (暗色 UI)
-├── static/echarts.min.js  # 离线图表
-├── data/fitness.db     # 数据库（单文件，拷贝即备份）
-├── .env.template       # LLM 配置模板
-└── README.md
-```
-
-## 数据备份
-
-拷贝 `data/fitness.db` 一个文件即可。建议每周备份到 iCloud 或外置盘。

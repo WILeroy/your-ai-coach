@@ -1,71 +1,82 @@
-"""Agent 核心循环: 流式对话 → 工具调用 → 确认机制 → 历史持久化"""
+"""Agent 核心循环 v2: 流式对话 -> 工具调用 -> 确认机制(SQLite持久化) -> 历史持久化 -> UI事件
+
+关键改进:
+- 确认状态存 SQLite(agent_pending_actions)，gunicorn 多 worker 安全
+- 工具结果含 view_spec 时自动推送 SSE "ui" 事件驱动前端画布
+- 工具轮耗尽仍无文字时，强制一次无工具总结调用，杜绝"(空)"回复
+- 确认/取消关键词仅在存在 pending action 时生效，避免误判
+"""
 import json
-import uuid
-import time
 from datetime import datetime
 from .config import AGENT_MAX_TOOL_ROUNDS, CHAT_HISTORY_LIMIT
-from .llm import is_available, chat_stream
+from .llm import is_available, chat_stream, chat
 from .context import build_system_prompt
-from .tools import TOOL_SCHEMAS, TOOL_MAP, store_pending, get_pending, cleanup_expired
+from .tools import (TOOL_SCHEMAS, TOOL_MAP, store_pending, get_pending,
+                    peek_pending_session, cleanup_expired)
 
-
-# ── 会话状态管理(内存) ──
-SESSION_STATES = {}
+CONFIRM_WORDS = {"确认", "yes", "ok", "好的", "可以", "执行", "confirm", "y",
+                 "确定", "确认执行", "确认一下"}
+CANCEL_WORDS = {"取消", "no", "否", "算了", "cancel", "n", "不要", "不执行"}
 
 
 def handle_message(user_text, session_id=''):
     """处理用户消息，返回 generator yield SSE 事件"""
     if not is_available():
-        yield _sse("error", {"message": "LLM 未配置"})
+        yield _sse("error", {"message": "LLM 未配置，请在 .env 填写 LLM_API_KEY 后重启服务"})
         return
 
     cleanup_expired()
 
-    # 检查是否是对确认的回复
-    normal_text, confirm_action = _parse_confirm(user_text)
-    if confirm_action:
-        yield from _handle_confirm(confirm_action, session_id)
-        return
-
-    # 正常对话流
-    messages = [{"role": "system", "content": build_system_prompt()}]
-    history = _load_history(session_id)
-    messages.extend(history)
-    messages.append({"role": "user", "content": normal_text})
-
-    tool_calls_log = []
-
-    yield from _agent_loop(messages, tool_calls_log, session_id, normal_text)
-
-
-def _agent_loop(messages, tool_calls_log, session_id, user_text):
-    """Agent 主循环: 流式输出 → 工具调用 → 继续"""
-    accumulated_content = ""
-    current_tool_calls = []
-
-    for round_n in range(AGENT_MAX_TOOL_ROUNDS + 1):
-        current_tool_calls = []
-        accumulated_content = ""
-
-        try:
-            stream = chat_stream(messages, tools=TOOL_SCHEMAS)
-        except Exception as e:
-            yield _sse("error", {"message": f"LLM调用失败: {str(e)[:200]}"})
+    # ── 确认/取消: 仅当该 session 存在 pending action ──
+    stripped = user_text.strip()
+    lower = stripped.lower()
+    if peek_pending_session(session_id):
+        if lower.startswith("/confirm"):
+            action_id = stripped.split(" ", 1)[1].strip() if " " in stripped else ""
+            yield from _handle_confirm(action_id, session_id, True)
+            return
+        if lower in CONFIRM_WORDS:
+            yield from _handle_confirm("", session_id, True)
+            return
+        if lower in CANCEL_WORDS:
+            yield from _handle_confirm("", session_id, False)
             return
 
-        # 收集流式响应 + 检测工具调用
-        tool_call_bufs = {}
-        finish_reason = None
+    # ── 正常对话流 ──
+    messages = [{"role": "system", "content": build_system_prompt()}]
+    messages.extend(_load_history(session_id))
+    messages.append({"role": "user", "content": user_text})
 
+    yield from _agent_loop(messages, [], session_id, user_text)
+
+
+# ═══════════════ Agent 主循环 ═══════════════
+
+def _agent_loop(messages, tool_calls_log, session_id, user_text):
+    """流式输出 -> 工具调用 -> 继续循环; 最后一轮禁用工具强制总结"""
+    accumulated_content = ""
+
+    for round_n in range(AGENT_MAX_TOOL_ROUNDS + 1):
+        use_tools = round_n < AGENT_MAX_TOOL_ROUNDS
+        accumulated_content = ""
+        tool_call_bufs = {}
+
+        try:
+            if use_tools:
+                stream = chat_stream(messages, tools=TOOL_SCHEMAS)
+            else:
+                stream = chat_stream(messages)
+        except Exception as e:
+            yield _sse("error", {"message": "LLM调用失败: %s" % str(e)[:200]})
+            return
+
+        # 收集流式响应 + 工具调用
         for chunk in stream:
             delta = chunk.choices[0].delta if chunk.choices else None
-            finish_reason = chunk.choices[0].finish_reason if chunk.choices else None
-
             if delta:
                 if delta.content:
                     accumulated_content += delta.content
                     yield _sse("delta", {"text": delta.content})
-
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
                         idx = tc.index
@@ -79,137 +90,131 @@ def _agent_loop(messages, tool_calls_log, session_id, user_text):
                             if tc.function.arguments:
                                 tool_call_bufs[idx]["function"]["arguments"] += tc.function.arguments
 
-        if tool_call_bufs:
-            # 构建完整的 tool_calls 列表
-            tool_calls = []
-            for idx in sorted(tool_call_bufs.keys()):
-                buf = tool_call_bufs[idx]
-                tool_calls.append({
-                    "id": buf["id"],
-                    "type": "function",
-                    "function": buf["function"]
-                })
+        if not (tool_call_bufs and use_tools):
+            break  # 无工具调用，最终回复
 
-            # 创建 assistant message 并追加到 messages
-            assistant_msg = {"role": "assistant", "content": accumulated_content or None, "tool_calls": tool_calls}
-            # format for OpenAI API
-            formatted_tool_calls = []
-            for tc in tool_calls:
-                formatted_tool_calls.append({
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": tc["function"]
-                })
-            assistant_msg = {"role": "assistant", "content": accumulated_content or None, "tool_calls": formatted_tool_calls}
-            messages.append(assistant_msg)
+        # ── 执行工具 ──
+        tool_calls = [tool_call_bufs[idx] for idx in sorted(tool_call_bufs.keys())]
+        messages.append({"role": "assistant", "content": accumulated_content or None,
+                         "tool_calls": [{"id": tc["id"], "type": "function",
+                                         "function": tc["function"]} for tc in tool_calls]})
 
-            for tc in tool_calls:
-                fn_name = tc["function"]["name"]
+        pending_pause = None
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            try:
+                fn_args = json.loads(tc["function"]["arguments"])
+            except json.JSONDecodeError:
+                fn_args = {}
+
+            yield _sse("tool_call", {"tool": fn_name, "args": fn_args})
+
+            if fn_name in TOOL_MAP:
                 try:
-                    fn_args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
-                    fn_args = {}
+                    result = TOOL_MAP[fn_name](**fn_args)
+                except Exception as e:
+                    result = {"error": str(e)}
+            else:
+                result = {"error": "未知工具 %s" % fn_name}
 
-                yield _sse("tool_call", {"tool": fn_name, "args": fn_args})
+            result_str = json.dumps(result, ensure_ascii=False, default=str)
+            tool_calls_log.append({"tool": fn_name, "args": fn_args,
+                                   "result_preview": result_str[:300]})
 
-                if fn_name in TOOL_MAP:
-                    try:
-                        result = TOOL_MAP[fn_name](**fn_args)
-                    except Exception as e:
-                        result = {"error": str(e)}
-                else:
-                    result = {"error": f"未知工具 {fn_name}"}
+            # 需要用户确认 -> 暂停循环
+            if isinstance(result, dict) and result.get("status") == "pending":
+                action_id = result.get("action_id", "")
+                messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": json.dumps({"status": "pending", "action_id": action_id},
+                                                       ensure_ascii=False)})
+                # 注意: 必须先追加 pending 工具消息再持久化，否则恢复后的
+                # messages 会缺少 tool 消息导致 LLM API 400
+                store_pending(action_id, fn_name, fn_args, session_id, tc["id"],
+                              {"messages": messages, "tool_calls_log": tool_calls_log})
+                pending_pause = (action_id, fn_name, result.get("preview", {}))
+                continue  # 处理完本轮所有工具再暂停
 
-                result_str = json.dumps(result, ensure_ascii=False, default=str)
-                tool_calls_log.append({"tool": fn_name, "args": fn_args, "result_preview": result_str[:300]})
+            # 可视化事件
+            if isinstance(result, dict):
+                if result.get("view_spec"):
+                    yield _sse("ui", result["view_spec"])
+                if result.get("ui_refresh"):
+                    yield _sse("ui", {"view": "refresh"})
 
-                # 检查是否需要确认
-                if isinstance(result, dict) and result.get("status") == "pending":
-                    action_id = result.get("action_id", str(uuid.uuid4())[:8])
+            yield _sse("tool_result", {"tool": fn_name, "result": result_str[:300]})
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
-                    # 保存会话状态
-                    SESSION_STATES[session_id] = {
-                        "messages": messages,
-                        "tool_calls_log": tool_calls_log,
-                        "round_n": round_n,
-                        "user_text": user_text,
-                        "created_at": time.time()
-                    }
-                    store_pending(action_id, fn_name, fn_args, {
-                        "session_id": session_id,
-                        "tool_call_id": tc["id"]
-                    })
+        if pending_pause:
+            action_id, fn_name, preview = pending_pause
+            yield _sse("pending_confirm", {
+                "action_id": action_id, "tool": fn_name, "preview": preview,
+                "message": "确认执行 %s ?" % fn_name})
+            return  # 等待用户确认
 
-                    yield _sse("pending_confirm", {
-                        "action_id": action_id,
-                        "tool": fn_name,
-                        "preview": result.get("preview", {}),
-                        "message": f"确认执行 {fn_name}?"
-                    })
+    # ── 空回复兜底 ──
+    if not accumulated_content.strip():
+        accumulated_content = _summarize_fallback(messages, tool_calls_log)
 
-                    # 追加工具结果到 messages (pending状态)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": json.dumps({"status": "pending", "action_id": action_id,
-                                               "message": "等待用户确认..."}, ensure_ascii=False)
-                    })
-                    return  # 暂停循环，等待确认
-
-                yield _sse("tool_result", {"tool": fn_name, "result": result_str[:300]})
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result_str
-                })
-        else:
-            # 没有工具调用，最终回复
-            break
-
-    # 循环结束，保存历史
-    reply = accumulated_content or "(空)"
+    reply = accumulated_content or "(出错了，请重试)"
     _save_history(session_id, user_text, reply, tool_calls_log)
     yield _sse("done", {"reply": reply, "tool_calls": tool_calls_log})
 
 
-def _handle_confirm(confirm_action, session_id):
-    """处理确认操作: 恢复上下文 + 执行已确认的工具 + 继续循环"""
-    action_id = confirm_action.get("action_id", "")
-    confirmed = confirm_action.get("confirmed", True)
+def _summarize_fallback(messages, tool_calls_log):
+    """工具轮耗尽仍无文字时，强制一次无工具总结"""
+    if not tool_calls_log:
+        return ""
+    import copy
+    m = copy.deepcopy(messages)
+    m.append({"role": "user",
+              "content": "(系统提示: 请根据以上工具调用结果，直接给用户一个简洁的中文总结回复，不要再调用工具)"})
+    try:
+        resp = chat(m, tools=None, max_tokens=512)
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        # 极端情况: 用工具结果拼一个摘要
+        parts = []
+        for t in tool_calls_log[-3:]:
+            parts.append("[%s] %s" % (t["tool"], t["result_preview"][:100]))
+        return "查询完成：\n" + "\n".join(parts)
 
-    state = SESSION_STATES.pop(session_id, None)
 
-    if not state:
-        yield _sse("error", {"message": "确认会话已过期，请重新描述操作"})
+# ═══════════════ 确认流程 ═══════════════
+
+def _handle_confirm(action_id, session_id, confirmed):
+    """确认/取消: 从 SQLite 恢复上下文 -> 执行(或取消) -> 继续循环"""
+    pending = get_pending(action_id or None, session_id)
+
+    if not pending:
+        if not confirmed:
+            reply = "已取消。还有什么需要帮助的吗？"
+            _save_history(session_id, "取消", reply, [])
+            yield _sse("delta", {"text": reply})
+            yield _sse("done", {"reply": reply, "tool_calls": []})
+            return
+        yield _sse("error", {"message": "确认操作已过期(10分钟)，请重新描述操作"})
         return
 
-    # 如果没有 action_id，从 pending_actions 中找属于此 session 的
-    if not action_id:
-        from .tools import _pending_actions
-        for aid, pdata in _pending_actions.items():
-            if pdata.get("context", {}).get("session_id") == session_id:
-                action_id = aid
-                break
-
-    pending = get_pending(action_id)
-
-    if confirmed and (not pending):
-        yield _sse("error", {"message": "确认操作已过期，请重新描述操作"})
-        return
-
+    state = pending["messages"]  # {"messages": [...], "tool_calls_log": [...]}
     messages = state["messages"]
-    tool_calls_log = state["tool_calls_log"]
-    user_text = state["user_text"]
+    tool_calls_log = state.get("tool_calls_log", [])
+    user_text = next((m["content"] for m in reversed(messages)
+                      if m.get("role") == "user"), "")
 
-    # 取消操作
     if not confirmed:
-        yield _sse("delta", {"text": "已取消操作。还有什么需要帮助的吗？"})
-        _save_history(session_id, user_text, "已取消操作。", tool_calls_log)
-        yield _sse("done", {"reply": "已取消操作。", "tool_calls": tool_calls_log})
+        # 把 pending 工具消息标记为取消
+        tc_id = pending.get("tool_call_id", "")
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id") == tc_id:
+                m["content"] = json.dumps({"status": "cancelled"}, ensure_ascii=False)
+                break
+        reply = "已取消操作。还有什么需要帮助的吗？"
+        _save_history(session_id, user_text, reply, tool_calls_log)
+        yield _sse("delta", {"text": reply})
+        yield _sse("done", {"reply": reply, "tool_calls": tool_calls_log})
         return
 
-    # 确认操作
+    # ── 确认执行 ──
     fn_name = pending["tool_name"]
     fn_args = dict(pending["args"])
     fn_args["confirmed"] = True
@@ -220,91 +225,63 @@ def _handle_confirm(confirm_action, session_id):
         except Exception as e:
             result = {"error": str(e)}
     else:
-        result = {"error": f"未知工具 {fn_name}"}
+        result = {"error": "未知工具 %s" % fn_name}
 
     result_str = json.dumps(result, ensure_ascii=False, default=str)
-    yield _sse("tool_result", {"tool": fn_name, "result": result_str[:300]})
+    tool_calls_log.append({"tool": fn_name, "args": fn_args, "result_preview": result_str[:300]})
 
-    tc_id = pending["context"].get("tool_call_id", "")
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "tool" and messages[i].get("tool_call_id") == tc_id:
-            messages[i]["content"] = result_str
+    # 替换 pending 工具消息为真实结果
+    tc_id = pending.get("tool_call_id", "")
+    for m in messages:
+        if m.get("role") == "tool" and m.get("tool_call_id") == tc_id:
+            m["content"] = result_str
             break
 
+    if isinstance(result, dict):
+        if result.get("view_spec"):
+            yield _sse("ui", result["view_spec"])
+        if result.get("ui_refresh"):
+            yield _sse("ui", {"view": "refresh"})
+
+    yield _sse("tool_result", {"tool": fn_name, "result": result_str[:300]})
     yield from _agent_loop(messages, tool_calls_log, session_id, user_text)
 
 
-def _parse_confirm(user_text):
-    """检测用户输入是否为确认操作"""
-    text = user_text.strip().lower()
-
-    confirm_keywords = ["确认", "yes", "是", "ok", "好的", "可以", "执行", "confirm", "y"]
-    cancel_keywords = ["取消", "no", "否", "不", "算了", "cancel", "n", "不要", "别"]
-
-    is_confirm = text in confirm_keywords or text.startswith("/confirm")
-    is_cancel = text in cancel_keywords
-
-    # 尝试提取 action_id (如 /confirm abc123)
-    action_id = ""
-    if text.startswith("/confirm "):
-        action_id = text.split("/confirm ", 1)[1].strip()
-        is_confirm = True
-
-    if is_confirm:
-        return "", {"action_id": action_id, "confirmed": True}
-    elif is_cancel:
-        return "", {"action_id": "", "confirmed": False}
-
-    # 检查是否处于等待确认状态
-    # 如果不是确认回复，返回原文本
-    return user_text, None
-
+# ═══════════════ 历史持久化 ═══════════════
 
 def _load_history(session_id=''):
+    if not session_id:
+        return []
     from db import get_db
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT role, content, tool_calls_json FROM chat_messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
-            [session_id, CHAT_HISTORY_LIMIT]
-        ).fetchall()
+            "SELECT role, content FROM chat_messages WHERE session_id=? AND role IN ('user','assistant') AND content != '(空)' ORDER BY id DESC LIMIT ?",
+            [session_id, CHAT_HISTORY_LIMIT]).fetchall()
     except Exception:
-        conn.close()
         return []
-
-    history = []
-    for r in reversed(rows):
-        history.append({"role": r['role'], "content": r['content']})
-    conn.close()
-    return history
+    finally:
+        conn.close()
+    return [{"role": r['role'], "content": r['content']} for r in reversed(rows)]
 
 
 def _save_history(session_id, user_text, reply, tool_calls_log=None):
+    if not session_id:
+        return
     from db import get_db
     conn = get_db()
     now = datetime.now().isoformat()
     conn.execute(
         "INSERT INTO chat_messages(session_id, role, content, created_at) VALUES(?,?,?,?)",
-        [session_id, "user", user_text, now]
-    )
+        [session_id, "user", user_text, now])
     tc_json = json.dumps(tool_calls_log, ensure_ascii=False) if tool_calls_log else None
     conn.execute(
         "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at) VALUES(?,?,?,?,?)",
-        [session_id, "assistant", reply, tc_json, now]
-    )
+        [session_id, "assistant", reply, tc_json, now])
     conn.commit()
     conn.close()
 
 
-def cleanup_sessions(max_age=3600):
-    """清理过期的会话状态"""
-    now = time.time()
-    expired = [k for k, v in SESSION_STATES.items() if now - v.get("created_at", 0) > max_age]
-    for k in expired:
-        del SESSION_STATES[k]
-
-
 def _sse(event, data):
-    """构建 SSE 事件字符串"""
     payload = json.dumps(data, ensure_ascii=False, default=str)
-    return f"event: {event}\ndata: {payload}\n\n"
+    return "event: %s\ndata: %s\n\n" % (event, payload)
