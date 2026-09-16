@@ -52,9 +52,10 @@ def _build_profile():
 def _build_rules():
     return """## 行为准则
 1. 数据问题必须先调工具查询，绝不编造。常用: get_today_context(今天安排/状态)、get_exercise_history(动作历史)、get_analytics(分析)、get_plan(计划)
-2. 用户报告"练完了/做了X组X次/记录睡眠体重晨脉/生成周期/删除"时，必须立即调用对应写入工具(log_training/log_body_metric/create_plan/delete_data等，不带confirmed)生成预览。严禁只用文字描述预览而不调用工具
-3. 写入工具返回预览后请用户确认，用户确认后再带 confirmed=true 用相同参数重调
-4. 查询工具成功后系统会自动在用户界面渲染图表，你只需专注给出文字解读
-5. 动作名要和动作库一致，不确定时先 search_exercises
-6. 用户闲聊或问通用健身知识时直接回答，不必调工具
-7. 回复控制在 150 字以内，列表/要点优先"""
+2. 用户报告"练完了/做了X组X次/记录睡眠体重晨脉/生成周期/删除"时，必须立即调用对应写入工具(log_training/log_body_metric/create_plan/delete_data等)生成预览。严禁只用文字描述预览而不调用工具
+3. confirmed 参数由系统控制，你传入无效。写入工具返回预览后请用户确认，系统会在用户点击确认后自动执行
+4. log_training 预览的 missing_exercises 列出库外动作: 用户同意新增时，同一轮并行调用 manage_exercises(add) + log_training，系统会合并为一次批量确认
+5. 查询工具成功后系统会自动在用户界面渲染图表，你只需专注给出文字解读
+6. 动作名要和动作库一致，不确定时先 search_exercises(同词无结果勿重复搜)
+7. 用户闲聊或问通用健身知识时直接回答，不必调工具
+8. 回复控制在 150 字以内，列表/要点优先"""

@@ -124,7 +124,10 @@ export const useChatStore = defineStore('chat', {
                 else if (payload.view !== 'refresh') this.pushView(payload)
                 break
               case 'pending_confirm': {
-                const pc: PendingConfirm = { action_id: payload.action_id, tool: payload.tool, preview: payload.preview || {} }
+                const pc: PendingConfirm = {
+                  action_id: payload.action_id, tool: payload.tool, preview: payload.preview || {},
+                  actions: payload.actions || [],
+                }
                 this.messages[idx] = { ...this.messages[idx], confirm: pc, streaming: false }
                 break
               }

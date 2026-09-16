@@ -24,6 +24,8 @@ CASES = [
     ("我练完了，杠铃深蹲60kg 5组5次", ["log_training"], True),
     ("记录：昨晚睡了7小时，体重76kg", ["log_body_metric"], True),
     ("有没有平台期？", ["get_analytics"], False),
+    ("帮我记一下今天的训练：泽奇深蹲 40kg 5组5次。这个动作库里可能没有，没有的话顺便帮我加上",
+     ["log_training", "manage_exercises"], True),
 ]
 
 

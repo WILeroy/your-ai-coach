@@ -16,8 +16,20 @@ from .tools import (TOOL_SCHEMAS, TOOL_MAP, store_pending, get_pending,
                     peek_pending_session, cleanup_expired)
 
 CONFIRM_WORDS = {"确认", "yes", "ok", "好的", "可以", "执行", "confirm", "y",
-                 "确定", "确认执行", "确认一下"}
+                 "确定", "确认执行", "确认一下", "确认全部", "全部确认"}
 CANCEL_WORDS = {"取消", "no", "否", "算了", "cancel", "n", "不要", "不执行"}
+
+# 确认门控: 这些工具的 confirmed 参数只信任 /api/chat/confirm 内部路径，
+# 模型在普通对话轮传入的 confirmed 会被强制剥离(一律按预览处理)
+GATED_TOOLS = {"log_training", "log_body_metric", "update_session", "delete_data",
+               "create_plan", "adjust_plan", "manage_exercises"}
+
+# 批量确认执行顺序: 先建动作库，再落训练记录，其余按原序
+_EXEC_ORDER = {"manage_exercises": 0, "log_training": 1}
+
+
+def _exec_key(action):
+    return _EXEC_ORDER.get(action.get("tool_name", ""), 2)
 
 # 写入意图检测(完成时态/记录类动词)，用于 flash 模型漏调写工具时的纠正
 _WRITE_INTENT_RE = re.compile(
@@ -109,13 +121,16 @@ def _agent_loop(messages, tool_calls_log, session_id, user_text, _retryed=False)
                          "tool_calls": [{"id": tc["id"], "type": "function",
                                          "function": tc["function"]} for tc in tool_calls]})
 
-        pending_pause = None
+        pending_actions = []  # 本轮全部待确认操作(批量)
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
             try:
                 fn_args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
                 fn_args = {}
+            # 门控: 剥离模型传入的 confirmed，写工具只能走 预览→用户确认→内部执行
+            if fn_name in GATED_TOOLS:
+                fn_args.pop("confirmed", None)
 
             yield _sse("tool_call", {"tool": fn_name, "args": fn_args})
 
@@ -131,18 +146,16 @@ def _agent_loop(messages, tool_calls_log, session_id, user_text, _retryed=False)
             tool_calls_log.append({"tool": fn_name, "args": fn_args,
                                    "result_preview": result_str[:300]})
 
-            # 需要用户确认 -> 暂停循环
+            # 需要用户确认 -> 收集(先不持久化)
             if isinstance(result, dict) and result.get("status") == "pending":
                 action_id = result.get("action_id", "")
                 messages.append({"role": "tool", "tool_call_id": tc["id"],
                                  "content": json.dumps({"status": "pending", "action_id": action_id},
                                                        ensure_ascii=False)})
-                # 注意: 必须先追加 pending 工具消息再持久化，否则恢复后的
-                # messages 会缺少 tool 消息导致 LLM API 400
-                store_pending(action_id, fn_name, fn_args, session_id, tc["id"],
-                              {"messages": messages, "tool_calls_log": tool_calls_log})
-                pending_pause = (action_id, fn_name, result.get("preview", {}))
-                continue  # 处理完本轮所有工具再暂停
+                pending_actions.append({"action_id": action_id, "tool_name": fn_name,
+                                        "args": fn_args, "tool_call_id": tc["id"],
+                                        "preview": result.get("preview", {})})
+                continue  # 继续处理剩余工具，保证全部 tool 消息 append 完
 
             # 可视化事件
             if isinstance(result, dict):
@@ -154,11 +167,19 @@ def _agent_loop(messages, tool_calls_log, session_id, user_text, _retryed=False)
             yield _sse("tool_result", {"tool": fn_name, "result": result_str[:300]})
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
-        if pending_pause:
-            action_id, fn_name, preview = pending_pause
+        if pending_actions:
+            # 全部工具消息已 append，快照完整；批量持久化为一条 pending
+            batch_id = pending_actions[0]["action_id"]
+            store_pending(batch_id, session_id, pending_actions,
+                          {"messages": messages, "tool_calls_log": tool_calls_log})
+            first = pending_actions[0]
             yield _sse("pending_confirm", {
-                "action_id": action_id, "tool": fn_name, "preview": preview,
-                "message": "确认执行 %s ?" % fn_name})
+                "action_id": batch_id,
+                "tool": first["tool_name"],
+                "preview": first.get("preview", {}),
+                "actions": [{"tool": a["tool_name"], "preview": a.get("preview", {})}
+                            for a in pending_actions],
+                "message": "确认执行 %d 项操作?" % len(pending_actions)})
             return  # 等待用户确认
 
     # ── 空回复兜底 ──
@@ -200,7 +221,7 @@ def _summarize_fallback(messages, tool_calls_log):
 # ═══════════════ 确认流程 ═══════════════
 
 def _handle_confirm(action_id, session_id, confirmed):
-    """确认/取消: 从 SQLite 恢复上下文 -> 执行(或取消) -> 继续循环"""
+    """确认/取消: 从 SQLite 恢复上下文 -> 批量执行(或取消) -> 继续循环"""
     pending = get_pending(action_id or None, session_id)
 
     if not pending:
@@ -216,53 +237,93 @@ def _handle_confirm(action_id, session_id, confirmed):
     state = pending["messages"]  # {"messages": [...], "tool_calls_log": [...]}
     messages = state["messages"]
     tool_calls_log = state.get("tool_calls_log", [])
+    actions = pending.get("actions", [])
     user_text = next((m["content"] for m in reversed(messages)
                       if m.get("role") == "user"), "")
+    summary = _actions_summary(actions)
 
     if not confirmed:
-        # 把 pending 工具消息标记为取消
-        tc_id = pending.get("tool_call_id", "")
-        for m in messages:
-            if m.get("role") == "tool" and m.get("tool_call_id") == tc_id:
-                m["content"] = json.dumps({"status": "cancelled"}, ensure_ascii=False)
-                break
-        reply = "已取消操作。还有什么需要帮助的吗？"
+        for a in actions:
+            for m in messages:
+                if m.get("role") == "tool" and m.get("tool_call_id") == a.get("tool_call_id"):
+                    m["content"] = json.dumps({"status": "cancelled"}, ensure_ascii=False)
+                    break
+        reply = "已取消 %s。需要调整的话直接告诉我。" % summary
         _save_history(session_id, user_text, reply, tool_calls_log)
         yield _sse("delta", {"text": reply})
         yield _sse("done", {"reply": reply, "tool_calls": tool_calls_log})
         return
 
-    # ── 确认执行 ──
-    fn_name = pending["tool_name"]
-    fn_args = dict(pending["args"])
-    fn_args["confirmed"] = True
+    # ── 确认执行: 按依赖排序(manage_exercises → log_training → 其余)，逐个执行并替换 tool 消息 ──
+    ordered = sorted(enumerate(actions), key=lambda t: (_exec_key(t[1]), t[0]))
+    ok_count, fail_count = 0, 0
+    for _, a in ordered:
+        fn_name = a.get("tool_name", "")
+        fn_args = dict(a.get("args", {}))
+        fn_args["confirmed"] = True
 
-    if fn_name in TOOL_MAP:
-        try:
-            result = TOOL_MAP[fn_name](**fn_args)
-        except Exception as e:
-            result = {"error": str(e)}
-    else:
-        result = {"error": "未知工具 %s" % fn_name}
+        if fn_name in TOOL_MAP:
+            try:
+                result = TOOL_MAP[fn_name](**fn_args)
+            except Exception as e:
+                result = {"error": str(e)}
+        else:
+            result = {"error": "未知工具 %s" % fn_name}
 
-    result_str = json.dumps(result, ensure_ascii=False, default=str)
-    tool_calls_log.append({"tool": fn_name, "args": fn_args, "result_preview": result_str[:300]})
+        result_str = json.dumps(result, ensure_ascii=False, default=str)
+        tool_calls_log.append({"tool": fn_name, "args": fn_args,
+                               "result_preview": result_str[:300]})
+        if isinstance(result, dict) and result.get("status") == "error":
+            fail_count += 1
+        else:
+            ok_count += 1
 
-    # 替换 pending 工具消息为真实结果
-    tc_id = pending.get("tool_call_id", "")
-    for m in messages:
-        if m.get("role") == "tool" and m.get("tool_call_id") == tc_id:
-            m["content"] = result_str
-            break
+        # 替换 pending 工具消息为真实结果
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id") == a.get("tool_call_id"):
+                m["content"] = result_str
+                break
 
-    if isinstance(result, dict):
-        if result.get("view_spec"):
-            yield _sse("ui", result["view_spec"])
-        if result.get("ui_refresh"):
-            yield _sse("ui", {"view": "refresh"})
+        if isinstance(result, dict):
+            if result.get("view_spec"):
+                yield _sse("ui", result["view_spec"])
+            if result.get("ui_refresh"):
+                yield _sse("ui", {"view": "refresh"})
 
-    yield _sse("tool_result", {"tool": fn_name, "result": result_str[:300]})
+        yield _sse("tool_result", {"tool": fn_name, "result": result_str[:300]})
+
+    # 给模型的执行摘要(作为下轮 user 消息，让回复带上下文)
+    if len(ordered) > 1:
+        exec_note = "（系统提示: 用户已确认，%d 项操作执行完毕(%d 成功/%d 失败: %s)，请据此简短总结）" % (
+            len(ordered), ok_count, fail_count, summary)
+        messages.append({"role": "user", "content": exec_note})
     yield from _agent_loop(messages, tool_calls_log, session_id, user_text)
+
+
+_TOOL_SUMMARY = {
+    "log_training": "记录训练", "log_body_metric": "记录身体指标",
+    "update_session": "修改训练", "delete_data": "删除数据",
+    "create_plan": "生成周期", "adjust_plan": "调整计划",
+    "manage_exercises": "动作库变更",
+}
+
+
+def _actions_summary(actions):
+    """生成操作摘要，如: 记录训练 + 动作库变更×2"""
+    if not actions:
+        return "操作"
+    counts = {}
+    order = []
+    for a in actions:
+        label = _TOOL_SUMMARY.get(a.get("tool_name", ""), a.get("tool_name", "?"))
+        if label not in counts:
+            order.append(label)
+        counts[label] = counts.get(label, 0) + 1
+    parts = []
+    for label in order:
+        n = counts[label]
+        parts.append(label if n == 1 else "%s×%d" % (label, n))
+    return " + ".join(parts)
 
 
 # ═══════════════ 历史持久化 ═══════════════

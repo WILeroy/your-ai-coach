@@ -45,6 +45,8 @@ export interface PendingConfirm {
   action_id: string
   tool: string
   preview: Record<string, unknown>
+  actions?: { tool: string; preview: Record<string, unknown> }[]
+  done?: boolean
 }
 
 export interface ChatSessionInfo {

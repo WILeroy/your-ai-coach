@@ -72,14 +72,16 @@ def test_log_training_sets_none_no_crash():
 def test_pending_state_cross_process_simulation():
     """模拟多 worker: 两次独立调用 store/get (各自新连接)"""
     from agent.tools import store_pending, get_pending, peek_pending_session
-    store_pending("aid-1", "log_body_metric", {"date": "2026-01-01"},
-                  "sess-multi", "tc-1",
+    store_pending("aid-1", "sess-multi",
+                  [{"tool_name": "log_body_metric", "args": {"date": "2026-01-01"},
+                    "tool_call_id": "tc-1", "preview": {}}],
                   {"messages": [{"role": "user", "content": "hi"}], "tool_calls_log": []})
     assert peek_pending_session("sess-multi") is True
     p = get_pending("aid-1", "sess-multi")
     assert p is not None
-    assert p["tool_name"] == "log_body_metric"
-    assert p["args"] == {"date": "2026-01-01"}
+    assert len(p["actions"]) == 1
+    assert p["actions"][0]["tool_name"] == "log_body_metric"
+    assert p["actions"][0]["args"] == {"date": "2026-01-01"}
     assert p["messages"]["messages"][0]["content"] == "hi"
     # 已取出后不再存在
     assert get_pending("aid-1", "sess-multi") is None
@@ -88,7 +90,9 @@ def test_pending_state_cross_process_simulation():
 def test_pending_expiry():
     from agent.tools import store_pending, get_pending
     from datetime import datetime, timedelta
-    store_pending("aid-exp", "log_body_metric", {}, "sess-exp", "tc", {"messages": [], "tool_calls_log": []})
+    store_pending("aid-exp", "sess-exp",
+                  [{"tool_name": "log_body_metric", "args": {}, "tool_call_id": "tc", "preview": {}}],
+                  {"messages": [], "tool_calls_log": []})
     # 手动改过期时间
     from db import get_db
     conn = get_db()

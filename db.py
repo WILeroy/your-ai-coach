@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS agent_pending_actions (
     tool_name TEXT NOT NULL,
     args_json TEXT NOT NULL,
     tool_call_id TEXT NOT NULL DEFAULT '',
+    actions_json TEXT,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
@@ -123,6 +124,10 @@ CREATE TABLE IF NOT EXISTS login_attempts (
 def init_db():
     conn = get_db()
     conn.executescript(SCHEMA)
+    # 增量迁移: 老库补 actions_json 列
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(agent_pending_actions)").fetchall()]
+    if "actions_json" not in cols:
+        conn.execute("ALTER TABLE agent_pending_actions ADD COLUMN actions_json TEXT")
     conn.commit()
     conn.close()
 
@@ -237,8 +242,8 @@ def merge_session_sets(session_id, payload):
     规则:
       - 每个动作按计划行(set_no 升序, 排除 extra 行)与实际组一一对位 → 更新 actual + status='done'
       - 实际组多于计划行 → 追加 extra 行
+      - 无计划行的新动作 → 替换语义(先删该动作已有的 done/extra 行再插入)，保证重复调用幂等
       - 计划行未被实际组覆盖 → status 由 planned 转 'skipped'(未做)
-      - 新动作(无计划行) → 全部作为 done 行新增(首组起沿用计划位为空)
     """
     conn = get_db()
     for item in payload:
@@ -247,6 +252,16 @@ def merge_session_sets(session_id, payload):
         planned_rows = conn.execute(
             "SELECT id FROM sets WHERE session_id=? AND exercise_id=? AND status != 'extra' ORDER BY set_no, id",
             [session_id, eid]).fetchall()
+        if not planned_rows:
+            # 新动作: 替换语义 — 清掉该动作此前的实际记录(避免重复调用导致组数翻倍)
+            conn.execute(
+                "DELETE FROM sets WHERE session_id=? AND exercise_id=? AND status IN ('done','extra')",
+                [session_id, eid])
+        else:
+            # 有计划行: 清掉此前的 extra 行(将由本次 groups 重新生成)，保证幂等
+            conn.execute(
+                "DELETE FROM sets WHERE session_id=? AND exercise_id=? AND status='extra'",
+                [session_id, eid])
         max_set_no = conn.execute(
             "SELECT COALESCE(MAX(set_no),0) as m FROM sets WHERE session_id=? AND exercise_id=?",
             [session_id, eid]).fetchone()['m']

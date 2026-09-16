@@ -100,5 +100,5 @@ python cli.py review
 
 ```bash
 cd web && npm install playwright-core --no-save && npx playwright install chromium
-cd .. && FIT_PW=你的口令 node scripts/e2e-check.mjs
+FIT_PW=你的口令 node web/e2e-check.mjs
 ```

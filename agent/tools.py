@@ -24,15 +24,22 @@ PENDING_EXPIRE_MINUTES = 10
 # 确认状态管理 (SQLite 持久化, 多 worker 安全)
 # ============================================================
 
-def store_pending(action_id, tool_name, args, session_id, tool_call_id, messages):
+def store_pending(action_id, session_id, actions, messages):
+    """批量存储待确认操作。
+    actions: [{tool_name, args, tool_call_id, preview}...] — 一轮内全部 pending 操作
+    必须在所有 tool 消息 append 完成后调用，保证快照完整。"""
     conn = get_db()
     now = datetime.now()
+    first = actions[0]
     conn.execute(
         """INSERT OR REPLACE INTO agent_pending_actions
-           (action_id, session_id, messages_json, tool_name, args_json, tool_call_id, created_at, expires_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
+           (action_id, session_id, messages_json, tool_name, args_json, tool_call_id,
+            actions_json, created_at, expires_at)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
         [action_id, session_id, json.dumps(messages, ensure_ascii=False, default=str),
-         tool_name, json.dumps(args, ensure_ascii=False, default=str), tool_call_id,
+         first["tool_name"], json.dumps(first.get("args", {}), ensure_ascii=False, default=str),
+         first.get("tool_call_id", ""),
+         json.dumps(actions, ensure_ascii=False, default=str),
          now.isoformat(), (now + timedelta(minutes=PENDING_EXPIRE_MINUTES)).isoformat()])
     conn.commit()
     conn.close()
@@ -62,7 +69,16 @@ def get_pending(action_id=None, session_id=None):
         return None
     d = dict(row)
     d['messages'] = json.loads(d.pop('messages_json'))
-    d['args'] = json.loads(d.pop('args_json'))
+    # 批量格式: actions_json 数组; 旧格式: 单 action 包装为数组
+    if d.get('actions_json'):
+        d.pop('tool_name', None)
+        d.pop('args_json', None)
+        d.pop('tool_call_id', None)
+        d['actions'] = json.loads(d.pop('actions_json'))
+    else:
+        d['actions'] = [{"tool_name": d.pop('tool_name'),
+                         "args": json.loads(d.pop('args_json', '{}')),
+                         "tool_call_id": d.pop('tool_call_id', '')}]
     return d
 
 
@@ -121,6 +137,33 @@ def _preview_or_execute(confirmed, build_preview, execute):
 
 def _weeks_ago(weeks):
     return (date.today() - timedelta(days=weeks * 7)).isoformat()
+
+
+# 动作名 -> pattern/equipment 推断(用于库外动作新增建议)
+_PATTERN_HINTS = [
+    (("蹲",), "squat"), (("硬拉", "罗马尼亚", "臀桥"), "hinge"),
+    (("推", "卧推", "飞鸟", "屈伸"), "push"), (("划船", "引体", "下拉", "拉"), "pull"),
+    (("弯举",), "accessory"), (("卷腹", "平板", "核心"), "core"),
+    (("拉伸", "泡沫轴"), "stretch"), (("跑", "间歇", "lsd"), "cardio"),
+]
+_EQUIPMENT_HINTS = [
+    (("杠铃", "直杠"), "barbell"), (("哑铃",), "dumbbell"),
+    (("绳索", "拉力器"), "cable"), (("悍马", "机", "器械"), "machine"),
+]
+
+
+def _infer_exercise_meta(name):
+    pattern = "accessory"
+    for kws, p in _PATTERN_HINTS:
+        if any(k in name for k in kws):
+            pattern = p
+            break
+    equipment = None
+    for kws, eq in _EQUIPMENT_HINTS:
+        if any(k in name for k in kws):
+            equipment = eq
+            break
+    return pattern, equipment
 
 
 # ============================================================
@@ -393,6 +436,7 @@ def tool_log_training(date=None, stype=None, sets=None, cardio=None, rpe=None, s
         p = {"date": d, "type": stype, "rpe": rpe, "sleep_h": sleep_h,
              "bodyweight": bodyweight, "notes": notes or ""}
         p["sets_summary"] = []
+        missing = []
         for s in sets:
             ename = s.get("exercise", s.get("name", ""))
             matched, candidates = _match_exercise(ename)
@@ -404,6 +448,12 @@ def tool_log_training(date=None, stype=None, sets=None, cardio=None, rpe=None, s
             if candidates:
                 item["candidates"] = candidates
             p["sets_summary"].append(item)
+            if not matched:
+                sug_pattern, sug_eq = _infer_exercise_meta(ename)
+                missing.append({"name": ename, "suggested_pattern": sug_pattern,
+                                "suggested_equipment": sug_eq})
+        if missing:
+            p["missing_exercises"] = missing
         if cardio and cardio.get("kind"):
             p["cardio_summary"] = {"kind": cardio["kind"], "distance_km": cardio.get("distance_km")}
         return p
@@ -686,9 +736,10 @@ TOOL_SCHEMAS = [
         ["kind"]),
     _fn("get_plan", "查周期计划日历+目标进度", {"cycle": _str("current或周期ID，默认current")}),
     _fn("get_body_metrics", "身体指标历史(体重/睡眠/晨脉)", {"days": _num("回看天数，默认90")}),
-    _fn("search_exercises", "模糊搜索动作库", {"keyword": _str("关键词")}, ["keyword"]),
+    _fn("search_exercises", "模糊搜索动作库。同一关键词无结果时不要重复搜索，直接告知用户并建议用 manage_exercises 新增",
+        {"keyword": _str("关键词")}, ["keyword"]),
     _fn("show_view", "让用户界面切换页面", {"page": _str("页面", enum=["coach", "dashboard", "trends", "review", "plan"])}, ["page"]),
-    _fn("log_training", "记录一次训练(需确认)。sets每项:{exercise,groups:[{kg,reps}]}",
+    _fn("log_training", "记录一次训练(需确认)。sets每项:{exercise,groups:[{kg,reps}]}。预览会返回 missing_exercises(库外动作及建议pattern)，用户同意新增时同一轮并行调用 manage_exercises(add)+log_training，系统会一次确认全部执行",
         {"date": _str("日期YYYY-MM-DD，默认今天"), "stype": _str("类型: legs/push/pull/interval/lsd/relax"),
          "sets": {"type": "array", "description": "动作组列表",
                   "items": {"type": "object", "properties": {
@@ -743,3 +794,19 @@ TOOL_MAP = {
     "log_body_metric": tool_log_body_metric,
     "manage_exercises": tool_manage_exercises,
 }
+
+
+def store_pending_batch_legacy(action_id, session_id, tool_name, args, tool_call_id, messages):
+    """以旧格式(单 action, 无 actions_json)写入，仅用于兼容性测试"""
+    conn = get_db()
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    conn.execute(
+        """INSERT OR REPLACE INTO agent_pending_actions
+           (action_id, session_id, messages_json, tool_name, args_json, tool_call_id, created_at, expires_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        [action_id, session_id, json.dumps(messages, ensure_ascii=False, default=str),
+         tool_name, json.dumps(args, ensure_ascii=False, default=str), tool_call_id,
+         now.isoformat(), (now + timedelta(minutes=PENDING_EXPIRE_MINUTES)).isoformat()])
+    conn.commit()
+    conn.close()

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { useChatStore } from '../stores/chat'
 import type { PendingConfirm } from '../types'
 
@@ -7,19 +8,30 @@ const store = useChatStore()
 
 const TOOL_LABELS: Record<string, string> = {
   log_training: '📝 记录训练', update_session: '✏️ 修改训练', delete_data: '🗑️ 删除数据',
-  adjust_plan: '📋 调整计划', create_plan: '🔄 生成周期', manage_exercises: '🏋️ 管理动作',
+  adjust_plan: '📋 调整计划', create_plan: '🔄 生成周期', manage_exercises: '🏋️ 动作库变更',
   log_body_metric: '📊 记录身体数据',
 }
 
-function rows(): [string, string][] {
+interface ActionItem { tool: string; preview: Record<string, unknown> }
+
+const items = computed<ActionItem[]>(() => {
+  if (props.confirm.actions?.length) return props.confirm.actions
+  return [{ tool: props.confirm.tool, preview: props.confirm.preview }]
+})
+
+const multi = computed(() => items.value.length > 1)
+
+function rows(preview: Record<string, unknown>): [string, string][] {
   const out: [string, string][] = []
-  const p = props.confirm.preview || {}
-  for (const [k, v] of Object.entries(p)) {
+  for (const [k, v] of Object.entries(preview || {})) {
     if (k === 'sets_summary' && Array.isArray(v)) {
       out.push(['动作', v.map((s: any) => {
         const g = (s.groups || []).join(' / ')
-        return `${s.exercise}: ${g}${s.exists_in_db === false ? ' ⚠️动作库无此动作' : ''}`
+        return `${s.exercise}: ${g}${s.exists_in_db === false ? ' ⚠️库外动作' : ''}`
       }).join('\n')])
+    } else if (k === 'missing_exercises' && Array.isArray(v)) {
+      out.push(['缺失动作', v.map((m: any) =>
+        `${m.name}(${m.suggested_pattern})`).join('、')])
     } else if (typeof v === 'object' && v !== null) {
       out.push([k, JSON.stringify(v)])
     } else if (v !== null && v !== undefined && v !== '') {
@@ -31,18 +43,30 @@ function rows(): [string, string][] {
 </script>
 
 <template>
-  <div class="confirm-card">
-    <div class="head">{{ TOOL_LABELS[confirm.tool] || confirm.tool }}</div>
-    <div class="rows">
-      <div v-for="([k, v], i) in rows()" :key="i" class="row">
-        <span class="k">{{ k }}</span>
-        <span class="v" style="white-space: pre-line">{{ v }}</span>
+  <div class="confirm-card" :class="{ done: confirm.done }">
+    <div class="head">
+      {{ multi ? `⚡ 批量操作（${items.length} 项）` : TOOL_LABELS[confirm.tool] || confirm.tool }}
+    </div>
+
+    <div v-for="(a, i) in items" :key="i" class="action-block" :class="{ multi }">
+      <div v-if="multi" class="action-title">{{ i + 1 }}. {{ TOOL_LABELS[a.tool] || a.tool }}</div>
+      <div class="rows">
+        <div v-for="([k, v], j) in rows(a.preview)" :key="j" class="row">
+          <span class="k">{{ k }}</span>
+          <span class="v" style="white-space: pre-line">{{ v }}</span>
+        </div>
       </div>
     </div>
-    <div class="actions">
-      <button class="btn yes" :disabled="store.sending" @click="store.confirm(confirm.action_id, true)">确认执行</button>
-      <button class="btn no" :disabled="store.sending" @click="store.confirm(confirm.action_id, false)">取消</button>
+
+    <div class="actions" v-if="!confirm.done">
+      <button class="btn yes" :disabled="store.sending" @click="store.confirm(confirm.action_id, true)">
+        {{ multi ? `确认全部 (${items.length})` : '确认执行' }}
+      </button>
+      <button class="btn no" :disabled="store.sending" @click="store.confirm(confirm.action_id, false)">
+        {{ multi ? '全部取消' : '取消' }}
+      </button>
     </div>
+    <div v-else class="done-mark">已处理 ✓</div>
   </div>
 </template>
 
@@ -51,17 +75,18 @@ function rows(): [string, string][] {
   margin-top: 8px; background: #131620; border: 1px solid #3a3320;
   border-radius: 10px; padding: 12px;
 }
+.confirm-card.done { opacity: 0.6; }
 .head { font-size: 13px; font-weight: 600; color: var(--orange); margin-bottom: 8px; }
-.rows { margin-bottom: 10px; }
+.action-block.multi { border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 8px; }
+.action-title { font-size: 12px; font-weight: 600; color: var(--text-bright); margin-bottom: 4px; }
+.rows { margin-bottom: 4px; }
 .row { display: flex; gap: 10px; font-size: 12px; padding: 3px 0; }
 .k { color: var(--text-dim); min-width: 52px; flex-shrink: 0; }
 .v { color: var(--text); word-break: break-all; }
-.actions { display: flex; gap: 8px; }
-.btn {
-  padding: 6px 16px; border-radius: 8px; border: none; font-size: 12px;
-  font-weight: 600; cursor: pointer;
-}
+.actions { display: flex; gap: 8px; margin-top: 10px; }
+.btn { padding: 6px 16px; border-radius: 8px; border: none; font-size: 12px; font-weight: 600; cursor: pointer; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .yes { background: var(--orange); color: #fff; }
 .no { background: #232736; color: var(--text-dim); }
+.done-mark { margin-top: 8px; font-size: 12px; color: var(--green); }
 </style>
