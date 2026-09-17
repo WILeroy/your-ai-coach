@@ -114,3 +114,8 @@ FIT_PW=你的口令 node web/e2e-check.mjs
 - 画布空闲时自动显示**今日概览**（今日动作明细/近7天完成/最新指标），点"回到概览"可随时恢复
 - 趋势/周报/计划改为对话查询 + 画布渲染（get_analytics/get_plan）
 - 移除 show_view 工具与 naive-ui 依赖
+
+## v2.4 课表替换工具
+
+- 新增 `replace_day_plan`：整天替换训练（改类型+清原组+写新组，仅限 planned），preview 展示新旧对比
+- `adjust_plan` 收窄为"微调当天已有动作"，向完整课表日新增动作会被确定性重定向到 replace_day_plan

@@ -888,6 +888,28 @@ def tool_adjust_plan(date=None, changes=None, confirmed=False, **kwargs):
     d = date or kwargs.get("date_")
     changes = changes or []
 
+    # 确定性拦截: 向已有完整课表(≥2个动作)的那天新增动作 = 整日替换意图，重定向
+    if d and changes:
+        conn = get_db()
+        row = conn.execute("SELECT id, type FROM sessions WHERE date=? AND status='planned'",
+                           [d]).fetchone()
+        if row:
+            existing = {r["name"] for r in conn.execute("""
+                SELECT e.name FROM sets st JOIN exercises e ON st.exercise_id=e.id
+                WHERE st.session_id=?""", [row["id"]]).fetchall()}
+            conn.close()
+            new_names = []
+            for ch in changes:
+                m, _ = _match_exercise(ch.get("exercise", ""))
+                if m and m not in existing:
+                    new_names.append(m)
+            if new_names and len(existing) >= 2:
+                return {"error": "%s 当天已有 %d 个动作(%s)，新增 %s 属于整日换课。请改用 replace_day_plan(date='%s', new_type=..., sets=[当天应保留+新增的全部动作]) 完成替换"
+                        % (d, len(existing), "、".join(sorted(existing))[:60],
+                           "、".join(new_names), d)}
+        else:
+            conn.close()
+
     def preview():
         conn = get_db()
         row = conn.execute("SELECT id FROM sessions WHERE date=? AND status='planned'",
@@ -925,6 +947,89 @@ def tool_adjust_plan(date=None, changes=None, confirmed=False, **kwargs):
         conn.commit()
         conn.close()
         return {"date": d, "adjusted": adjusted}
+
+    return _preview_or_execute(confirmed, preview, execute)
+
+
+DAY_TYPES = ("legs", "push", "pull", "interval", "lsd", "relax", "rest")
+
+
+def tool_replace_day_plan(date=None, new_type=None, sets=None, notes=None,
+                          confirmed=False, **kwargs):
+    """整天替换训练计划: 改类型+清原计划组+写新组(需确认)。已完成训练不可替换"""
+    d = date or kwargs.get("date_")
+    if not d:
+        return {"error": "date 必填 YYYY-MM-DD"}
+    if new_type not in DAY_TYPES:
+        return {"error": "new_type 必须是: %s" % "/".join(DAY_TYPES)}
+    sets = sets or []
+
+    def _old_summary(conn, sid):
+        s = conn.execute("SELECT type, status, notes FROM sessions WHERE id=?", [sid]).fetchone()
+        rows = conn.execute("""
+            SELECT e.name, st.planned_kg, st.planned_reps FROM sets st
+            JOIN exercises e ON st.exercise_id=e.id
+            WHERE st.session_id=? AND st.status='planned'""", [sid]).fetchall()
+        by_ex = {}
+        for r in rows:
+            by_ex.setdefault(r["name"], {"kg": r["planned_kg"], "reps": r["planned_reps"], "n": 0})
+            by_ex[r["name"]]["n"] += 1
+        items = ["%s %s×%s×%d组" % (k, v["kg"] if v["kg"] is not None else "自重",
+                                     v["reps"] or "?", v["n"]) for k, v in by_ex.items()]
+        return {"type": s["type"], "status": s["status"], "notes": s["notes"] or "",
+                "exercises": items}
+
+    def preview():
+        conn = get_db()
+        row = conn.execute("SELECT id FROM sessions WHERE date=? AND status='planned'",
+                           [d]).fetchone()
+        if not row:
+            conn.close()
+            return {"error": "%s 没有可替换的计划(仅能替换 planned 状态的训练日；已完成训练请用补录)" % d}
+        old = _old_summary(conn, row["id"])
+        conn.close()
+        new_items = []
+        for s in sets:
+            matched, cands = _match_exercise(s.get("exercise", s.get("name", "")))
+            groups = s.get("groups") or ([s] if "kg" in s else [])
+            item = {"exercise": matched or s.get("exercise", s.get("name", "")),
+                    "exists_in_db": bool(matched),
+                    "groups": ["%skg×%s" % (g.get("kg", "?"), g.get("reps", "?")) for g in groups]}
+            if cands:
+                item["candidates"] = cands
+            new_items.append(item)
+        return {"date": d, "old": old,
+                "new": {"type": new_type, "notes": notes or "", "exercises": new_items}}
+
+    def execute():
+        conn = get_db()
+        row = conn.execute("SELECT id FROM sessions WHERE date=? AND status='planned'",
+                           [d]).fetchone()
+        if not row:
+            conn.close()
+            return {"error": "%s 没有可替换的计划(仅能替换 planned 状态；已完成训练请用补录)" % d}
+        sid = row["id"]
+        # 清掉全部 planned 组(不动已有 actual 数据)
+        conn.execute("DELETE FROM sets WHERE session_id=? AND status='planned'", [sid])
+        conn.execute("UPDATE sessions SET type=?, notes=? WHERE id=?",
+                     [new_type, notes or "", sid])
+        ex_map = exercises_map()
+        replaced = []
+        for s in sets:
+            matched, _ = _match_exercise(s.get("exercise", s.get("name", "")))
+            if not matched:
+                continue
+            eid = ex_map[matched]
+            groups = s.get("groups") or ([s] if "kg" in s else [])
+            for i, g in enumerate(groups, 1):
+                conn.execute(
+                    "INSERT INTO sets(session_id,exercise_id,set_no,planned_kg,planned_reps,status) VALUES(?,?,?,?,?,'planned')",
+                    [sid, eid, i, g.get("kg"), g.get("reps")])
+            replaced.append({"exercise": matched, "sets": len(groups)})
+        conn.commit()
+        conn.close()
+        return {"date": d, "new_type": new_type, "session_id": sid,
+                "replaced_exercises": replaced, "note": "原计划组已清空并替换"}
 
     return _preview_or_execute(confirmed, preview, execute)
 
@@ -1044,10 +1149,17 @@ TOOL_SCHEMAS = [
              "exercise": _str("动作"), "from": _num("当前kg"), "to": _num("目标kg"),
              "sets": _num("组数"), "reps": _num("次数")}}},
          "confirmed": {"type": "boolean"}}, ["start_date"]),
-    _fn("adjust_plan", "调整某天计划的动作组(需确认)",
+    _fn("adjust_plan", "微调某天动作的组数/重量/增删个别动作(需确认)。不能改训练类型！用户要求'改成练X/换课'时禁用本工具，必须用 replace_day_plan",
         {"date": _str("日期YYYY-MM-DD"), "changes": {"type": "array", "items": {"type": "object", "properties": {
             "exercise": _str("动作名"), "groups": _GROUPS}}},
          "confirmed": {"type": "boolean"}}, ["date", "changes"]),
+    _fn("replace_day_plan", "整天替换训练计划(需确认)：改训练类型+清掉原动作组+写入新动作组。用户说'把某天改成练腿/练推/跑步'或更换整天的课时必须用本工具(而不是adjust_plan)。仅限 planned 状态",
+        {"date": _str("日期YYYY-MM-DD"), "new_type": _str("新类型", enum=list(DAY_TYPES)),
+         "sets": {"type": "array", "description": "新动作组列表",
+                  "items": {"type": "object", "properties": {
+                      "exercise": _str("动作名"), "groups": _GROUPS}}},
+         "notes": _str("新备注"), "confirmed": {"type": "boolean"}},
+        ["date", "new_type"]),
     _fn("log_body_metric", "记录身体指标(需确认)",
         {"date": _str("日期YYYY-MM-DD"), "weight": _num("体重kg"), "sleep_h": _num("睡眠h"),
          "resting_hr": _num("晨脉bpm"), "confirmed": {"type": "boolean"}}, ["date"]),
@@ -1074,6 +1186,7 @@ TOOL_MAP = {
     "delete_data": tool_delete_data,
     "create_plan": tool_create_plan,
     "adjust_plan": tool_adjust_plan,
+    "replace_day_plan": tool_replace_day_plan,
     "log_body_metric": tool_log_body_metric,
     "manage_exercises": tool_manage_exercises,
 }
