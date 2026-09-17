@@ -1,16 +1,29 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick, watch } from 'vue'
-import { useRouter } from 'vue-router'
-import { NPopconfirm } from 'naive-ui'
+import { logout } from '../api/client'
 import { useChatStore } from '../stores/chat'
 import ChatMessage from '../components/ChatMessage.vue'
 import DynamicCanvas from '../components/DynamicCanvas.vue'
 
 const store = useChatStore()
-const router = useRouter()
 const input = ref('')
 const listEl = ref<HTMLElement>()
 const showSessions = ref(false)
+const armDel = ref('')     // 已进入二次确认的 session_id
+const armClear = ref(false)
+let armTimer: number | undefined
+function armDelete(sid: string) {
+  if (armDel.value === sid) { store.deleteSession(sid); armDel.value = ''; return }
+  armDel.value = sid
+  clearTimeout(armTimer)
+  armTimer = window.setTimeout(() => { armDel.value = '' }, 3000)
+}
+function armDeleteAll() {
+  if (armClear.value) { store.deleteAllSessions(); armClear.value = false; return }
+  armClear.value = true
+  clearTimeout(armTimer)
+  armTimer = window.setTimeout(() => { armClear.value = false }, 3000)
+}
 
 const QUICK = ['今天练什么？', '深蹲趋势如何？', '本周训练情况', '我的负荷状态怎么样？']
 
@@ -29,9 +42,7 @@ function send(text?: string) {
   const content = (text || input.value).trim()
   if (!content) return
   input.value = ''
-  store.send(content, (page) => {
-    if (['dashboard', 'trends', 'review', 'plan'].includes(page)) router.push('/' + page)
-  })
+  store.send(content)
 }
 </script>
 
@@ -46,6 +57,7 @@ function send(text?: string) {
         <div class="head-actions">
           <button class="hbtn" @click="showSessions = !showSessions">历史</button>
           <button class="hbtn" @click="store.newSession()">新会话</button>
+          <button class="hbtn out" title="退出登录" @click="logout()">退出</button>
         </div>
       </div>
 
@@ -59,21 +71,13 @@ function send(text?: string) {
             <div class="s-title">{{ s.title || s.session_id }}</div>
             <div class="s-meta">{{ (s.last_at || '').slice(0, 16).replace('T', ' ') }} · {{ s.msg_count }}条</div>
           </div>
-          <n-popconfirm @positive-click="store.deleteSession(s.session_id)">
-            <template #trigger>
-              <button class="s-del" title="删除会话"
-                @click.stop>🗑</button>
-            </template>
-            删除该会话的全部对话？
-          </n-popconfirm>
+          <button class="s-del" :class="{ armed: armDel === s.session_id }" :title="armDel === s.session_id ? '再次点击确认删除' : '删除会话'"
+            @click.stop="armDelete(s.session_id)">{{ armDel === s.session_id ? '确认?' : '🗑' }}</button>
         </div>
         <div v-if="store.sessions.length" class="drawer-footer">
-          <n-popconfirm @positive-click="store.deleteAllSessions()">
-            <template #trigger>
-              <button class="clear-all-btn">清空全部会话</button>
-            </template>
-            确定清空所有历史对话？此操作不可恢复。
-          </n-popconfirm>
+          <button class="clear-all-btn" :class="{ armed: armClear }" @click="armDeleteAll()">
+            {{ armClear ? '再点一次确认清空(不可恢复)' : '清空全部会话' }}
+          </button>
         </div>
       </div>
 
@@ -128,6 +132,7 @@ function send(text?: string) {
   font-size: 12px; padding: 5px 12px; border-radius: 8px; cursor: pointer;
 }
 .hbtn:hover { color: var(--orange); border-color: var(--orange); }
+.hbtn.out:hover { color: var(--red); border-color: var(--red); }
 
 .sessions-drawer {
   max-height: 240px; overflow-y: auto; background: var(--bg-deep);
@@ -148,12 +153,14 @@ function send(text?: string) {
 }
 .session-item:hover .s-del { opacity: 1; }
 .s-del:hover { color: var(--red); background: rgba(224,85,106,0.1); }
+.s-del.armed { opacity: 1; color: #fff; background: var(--red); font-size: 10px; }
 .drawer-footer { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; text-align: center; }
 .clear-all-btn {
   background: none; border: 1px solid var(--border); color: var(--text-dim);
   font-size: 11px; padding: 4px 14px; border-radius: 8px; cursor: pointer;
 }
 .clear-all-btn:hover { color: var(--red); border-color: var(--red); }
+.clear-all-btn.armed { color: #fff; background: var(--red); border-color: var(--red); }
 
 .chat-list { flex: 1; overflow-y: auto; padding: 18px; }
 .welcome {
@@ -187,11 +194,8 @@ textarea:focus { border-color: var(--orange); }
 .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 @media (max-width: 768px) {
-  .coach { flex-direction: column; height: auto; min-height: 100vh; }
+  .coach { flex-direction: column; height: 100vh; }
   .chat-pane { border-right: none; height: calc(100vh - 64px); }
-  .canvas-pane {
-    display: none; height: auto; min-height: 60vh; padding: 0;
-  }
-  .canvas-pane:target, .coach.show-canvas .canvas-pane { display: block; }
+  .canvas-pane { display: none; }
 }
 </style>

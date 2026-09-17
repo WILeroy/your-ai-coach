@@ -6,10 +6,6 @@ const router = createRouter({
     { path: '/', redirect: '/coach' },
     { path: '/login', component: () => import('../pages/LoginPage.vue') },
     { path: '/coach', component: () => import('../pages/CoachPage.vue') },
-    { path: '/dashboard', component: () => import('../pages/DashboardPage.vue') },
-    { path: '/trends', component: () => import('../pages/TrendsPage.vue') },
-    { path: '/review', component: () => import('../pages/ReviewPage.vue') },
-    { path: '/plan', component: () => import('../pages/PlanPage.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/coach' },
   ],
 })

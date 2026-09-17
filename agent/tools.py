@@ -697,12 +697,6 @@ def tool_web_fetch(url, max_chars=4000, **kwargs):
             "truncated": len(text) > max_chars}
 
 
-def tool_show_view(page, **kwargs):
-    """让前端切换页面: coach/dashboard/trends/review/plan"""
-    valid = {"coach", "dashboard", "trends", "review", "plan"}
-    if page not in valid:
-        return {"error": "未知页面 %s" % page, "available": sorted(valid)}
-    return {"status": "done", "view_spec": {"view": "navigate", "page": page}}
 
 
 # ============================================================
@@ -1027,7 +1021,6 @@ TOOL_SCHEMAS = [
         {"query": _str("搜索关键词"), "max_results": _num("条数，默认5，最多8")}, ["query"]),
     _fn("web_fetch", "读取指定网页正文纯文本。web_search摘要不够时用；部分反爬站点会失败",
         {"url": _str("完整URL http/https"), "max_chars": _num("正文截取字数，默认4000")}, ["url"]),
-    _fn("show_view", "让用户界面切换页面", {"page": _str("页面", enum=["coach", "dashboard", "trends", "review", "plan"])}, ["page"]),
     _fn("log_training", "记录一次训练(需确认)。sets每项:{exercise,groups:[{kg,reps}]}。预览会返回 missing_exercises(库外动作及建议pattern)，用户同意新增时同一轮并行调用 manage_exercises(add)+log_training，系统会一次确认全部执行",
         {"date": _str("日期YYYY-MM-DD，默认今天"), "stype": _str("类型: legs/push/pull/interval/lsd/relax"),
          "sets": {"type": "array", "description": "动作组列表",
@@ -1076,7 +1069,6 @@ TOOL_MAP = {
     "search_exercises": tool_search_exercises,
     "web_search": tool_web_search,
     "web_fetch": tool_web_fetch,
-    "show_view": tool_show_view,
     "log_training": tool_log_training,
     "update_session": tool_update_session,
     "delete_data": tool_delete_data,

@@ -85,6 +85,38 @@ def api_chat_status():
     })
 
 
+@app.route("/api/canvas/default")
+def api_canvas_default():
+    """画布空闲时的默认「今日概览」(纯只读，不过LLM)"""
+    from agent.tools import tool_get_today_context, WEEKDAY_CN
+    from datetime import date
+    ctx = tool_get_today_context()
+    views = [ctx["view_spec"]]
+
+    # 今日动作明细表
+    rows = []
+    for s in ctx.get("today_sessions", []):
+        for ex_name, sets in (s.get("exercises") or {}).items():
+            for st in sets:
+                rows.append({
+                    "动作": ex_name, "组": st["set_no"],
+                    "计划": st.get("planned") or "—",
+                    "实际": st.get("actual") or "—",
+                    "状态": st.get("status") or "",
+                })
+    if rows:
+        views.append({"view": "table", "title": "今日训练明细",
+                      "columns": [{"key": "动作", "label": "动作"}, {"key": "组", "label": "组"},
+                                  {"key": "计划", "label": "计划"}, {"key": "实际", "label": "实际"},
+                                  {"key": "状态", "label": "状态"}],
+                      "rows": rows})
+    else:
+        views.append({"view": "table", "title": "今日无训练计划 💤",
+                      "columns": [{"key": "提示", "label": "提示"}],
+                      "rows": [{"提示": "今天没有安排训练，好好休息"}]})
+    return jsonify({"views": views, "today": ctx["today"], "weekday": ctx["weekday"]})
+
+
 @app.route("/api/chat/sessions")
 def api_chat_sessions():
     conn = get_db()

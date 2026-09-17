@@ -131,3 +131,22 @@ def test_summarize_fallback_never_empty(monkeypatch):
         [{"role": "user", "content": "hi"}],
         [{"tool": "get_plan", "args": {}, "result_preview": '{"cycle": {...}}'}])
     assert out and "get_plan" in out
+
+
+def test_canvas_default_endpoint():
+    """单页版: 画布默认今日概览接口"""
+    import app as app_mod
+    app_mod.app.config["TESTING"] = True
+    client = app_mod.app.test_client()
+    r = client.get("/api/canvas/default")
+    assert r.status_code == 401
+    with client.session_transaction() as sess:
+        sess["authed"] = True
+    r = client.get("/api/canvas/default")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert "today" in d and "weekday" in d
+    views = d["views"]
+    assert len(views) >= 2
+    assert views[0]["view"] == "metric_cards"
+    assert views[1]["view"] == "table"
