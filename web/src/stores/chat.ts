@@ -148,6 +148,9 @@ export const useChatStore = defineStore('chat', {
                   action_id: payload.action_id, tool: payload.tool, preview: payload.preview || {},
                   actions: payload.actions || [],
                 }
+                // 新确认卡出现时，旧卡片置为已处理(避免点击过期卡片)
+                this.messages = this.messages.map(m =>
+                  m.confirm ? { ...m, confirm: { ...m.confirm, done: true } } : m)
                 this.messages[idx] = { ...this.messages[idx], confirm: pc, streaming: false }
                 break
               }

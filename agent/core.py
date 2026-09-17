@@ -237,7 +237,7 @@ def _handle_confirm(action_id, session_id, confirmed):
             yield _sse("delta", {"text": reply})
             yield _sse("done", {"reply": reply, "tool_calls": []})
             return
-        yield _sse("error", {"message": "确认操作已过期(10分钟)，请重新描述操作"})
+        yield _sse("error", {"message": "确认操作已过期(24小时)，请重新描述操作"})
         return
 
     state = pending["messages"]  # {"messages": [...], "tool_calls_log": [...]}

@@ -24,7 +24,7 @@ from analytics import (compute_e1rm_history, compute_volume_trend, compute_acwr,
                         running_economy_trend, epley_e1rm)
 
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-PENDING_EXPIRE_MINUTES = 10
+PENDING_EXPIRE_MINUTES = 1440  # 24小时: 允许用户离开页面后回来确认
 
 
 # ============================================================
