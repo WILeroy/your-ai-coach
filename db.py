@@ -20,6 +20,17 @@ CREATE TABLE IF NOT EXISTS exercises (
     notes TEXT
 );
 
+-- 一个标准动作可以有多个用户/中文/英文别名。写入时别名会被解析到 canonical exercise，
+-- 避免同一动作因“胸推/卧推/bench press”等命名差异被拆成多条历史。
+CREATE TABLE IF NOT EXISTS exercise_aliases (
+    id INTEGER PRIMARY KEY,
+    exercise_id INTEGER NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
+    alias TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL DEFAULT 'builtin', -- builtin/learned/user
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_exercise_aliases_exercise ON exercise_aliases(exercise_id);
+
 CREATE TABLE IF NOT EXISTS cycles (
     id INTEGER PRIMARY KEY,
     start_date TEXT NOT NULL,
@@ -40,7 +51,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     bodyweight REAL,
     rpe REAL,                    -- session RPE 1-10
     status TEXT DEFAULT 'planned', -- planned/done/partial/skipped/rest
-    notes TEXT,
+    notes TEXT,                  -- legacy: 迁移前计划/完成备注混用
+    planned_notes TEXT,          -- 课表设计/处方备注
+    actual_notes TEXT,           -- 执行情况/完成备注
     UNIQUE(date, type)
 );
 
@@ -77,6 +90,7 @@ CREATE TABLE IF NOT EXISTS body_metrics (
     weight REAL,
     sleep_h REAL,
     resting_hr INTEGER,
+    hrv_ms REAL,
     notes TEXT
 );
 
@@ -128,8 +142,103 @@ def init_db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(agent_pending_actions)").fetchall()]
     if "actions_json" not in cols:
         conn.execute("ALTER TABLE agent_pending_actions ADD COLUMN actions_json TEXT")
+    body_cols = [r[1] for r in conn.execute("PRAGMA table_info(body_metrics)").fetchall()]
+    if "hrv_ms" not in body_cols:
+        conn.execute("ALTER TABLE body_metrics ADD COLUMN hrv_ms REAL")
+    session_cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+    if "planned_notes" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN planned_notes TEXT")
+    if "actual_notes" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN actual_notes TEXT")
+    _migrate_session_notes(conn)
+    _sync_builtin_exercise_aliases(conn)
+    _repair_session_execution_status(conn)
     conn.commit()
     conn.close()
+
+
+def _migrate_session_notes(conn):
+    """把旧 notes 按当时状态拆成计划/完成备注；幂等，不修改原始 legacy 字段。"""
+    conn.execute("""
+        UPDATE sessions
+        SET actual_notes=COALESCE(actual_notes, notes)
+        WHERE status IN ('done', 'partial') AND notes IS NOT NULL AND notes != ''
+    """)
+    conn.execute("""
+        UPDATE sessions
+        SET planned_notes=COALESCE(planned_notes, notes)
+        WHERE status NOT IN ('done', 'partial') AND notes IS NOT NULL AND notes != ''
+    """)
+
+
+def _repair_session_execution_status(conn):
+    """让状态与实际记录一致，防止“备注已完成但状态仍 planned”。"""
+    rows = conn.execute("""
+        SELECT s.id, s.status,
+               SUM(CASE WHEN st.actual_reps IS NOT NULL OR st.actual_kg IS NOT NULL
+                        THEN 1 ELSE 0 END) AS actual_sets,
+               COUNT(st.id) AS total_sets
+        FROM sessions s
+        LEFT JOIN sets st ON st.session_id=s.id
+        GROUP BY s.id
+    """).fetchall()
+    for r in rows:
+        actual = r["actual_sets"] or 0
+        total = r["total_sets"] or 0
+        if r["status"] == "planned" and actual:
+            new_status = "done" if actual >= total else "partial"
+            conn.execute("UPDATE sessions SET status=? WHERE id=?", [new_status, r["id"]])
+
+    # 兼容早期用备注代替状态写入的 Relax 课：只有明确括号标记才修复，避免误判普通计划备注。
+    conn.execute("""
+        UPDATE sessions
+        SET status='done',
+            actual_notes=COALESCE(actual_notes, '用户已标注完成'),
+            planned_notes=TRIM(REPLACE(REPLACE(COALESCE(planned_notes, notes),
+                                               '（已完成）', ''), '(已完成)', ''))
+        WHERE (status='planned' OR actual_notes='用户已标注完成')
+          AND (notes LIKE '%（已完成）%' OR notes LIKE '%(已完成)%')
+    """)
+
+
+# 只为当前库确实存在的标准动作建立别名；不会把用户自定义动作误并入内置动作。
+BUILTIN_EXERCISE_ALIASES = {
+    "卧推": "杠铃卧推",
+    "平卧推": "杠铃卧推",
+    "胸推": "杠铃卧推",
+    "bench press": "杠铃卧推",
+    "深蹲": "杠铃深蹲",
+    "颈后深蹲": "杠铃深蹲",
+    "squat": "杠铃深蹲",
+    "硬拉": "传统硬拉",
+    "deadlift": "传统硬拉",
+    "划船": "杠铃划船",
+    "杠铃俯身划船": "杠铃划船",
+    "推肩": "坐姿哑铃推肩",
+    "肩推": "坐姿哑铃推肩",
+    "哑铃推举": "坐姿哑铃推肩",
+    "shoulder press": "坐姿哑铃推肩",
+    "高位下拉": "引体/高位下拉",
+    "lat pulldown": "引体/高位下拉",
+    "腿举": "倒蹬",
+    "leg press": "倒蹬",
+    "上斜卧推": "上斜杠铃卧推",
+    "二头弯举": "哑铃弯举",
+    "哑铃二头弯举": "哑铃弯举",
+    "dumbbell curl": "哑铃弯举",
+}
+
+
+def _sync_builtin_exercise_aliases(conn):
+    existing = {r[0] for r in conn.execute("SELECT name FROM exercises").fetchall()}
+    for alias, canonical in BUILTIN_EXERCISE_ALIASES.items():
+        # alias 本身已经是标准动作时不覆盖 canonical 身份。
+        if alias in existing or canonical not in existing:
+            continue
+        conn.execute(
+            """INSERT OR IGNORE INTO exercise_aliases(exercise_id, alias, source)
+               SELECT id, ?, 'builtin' FROM exercises WHERE name=?""",
+            [alias, canonical])
 
 def backup_db_if_new_day():
     """每日首次调用时备份数据库（幂等）。"""
@@ -214,9 +323,16 @@ def insert_exercise(name, pattern, equipment=None, is_main=0, notes=None):
     conn.close()
 
 # ── 合并式录入(不破坏计划数据) ──
-def upsert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None, bodyweight=None, rpe=None, status='planned', notes=''):
-    """session 存在则 UPDATE(保留 id 和子表数据), 不存在则 INSERT"""
+def upsert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None,
+                   bodyweight=None, rpe=None, status='planned', notes=None,
+                   planned_notes=None, actual_notes=None):
+    """合并式更新 session；notes 是兼容参数，按状态路由且空值不覆盖。"""
     conn = get_db()
+    legacy_note = notes if notes not in (None, "") else None
+    if planned_notes is None:
+        planned_notes = legacy_note if status not in ("done", "partial") else None
+    if actual_notes is None:
+        actual_notes = legacy_note if status in ("done", "partial") else None
     row = conn.execute("SELECT id FROM sessions WHERE date=? AND type=?", [date, type_]).fetchone()
     if row:
         sid = row['id']
@@ -224,17 +340,35 @@ def upsert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None, bodywei
             UPDATE sessions SET
               cycle_id=COALESCE(?,cycle_id), week_no=COALESCE(?,week_no), day_no=COALESCE(?,day_no),
               sleep_h=COALESCE(?,sleep_h), bodyweight=COALESCE(?,bodyweight), rpe=COALESCE(?,rpe),
-              status=?, notes=?
+              status=?,
+              notes=COALESCE(?, notes),
+              planned_notes=COALESCE(?, planned_notes),
+              actual_notes=COALESCE(?, actual_notes)
             WHERE id=?""",
-            [cycle_id, week_no, day_no, sleep_h, bodyweight, rpe, status, notes, sid])
+            [cycle_id, week_no, day_no, sleep_h, bodyweight, rpe, status,
+             legacy_note, planned_notes if planned_notes not in (None, "") else None,
+             actual_notes if actual_notes not in (None, "") else None, sid])
     else:
         cur = conn.execute(
-            "INSERT INTO sessions(date,cycle_id,week_no,day_no,type,sleep_h,bodyweight,rpe,status,notes) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            [date, cycle_id, week_no, day_no, type_, sleep_h, bodyweight, rpe, status, notes])
+            """INSERT INTO sessions(date,cycle_id,week_no,day_no,type,sleep_h,bodyweight,rpe,
+                                   status,notes,planned_notes,actual_notes)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [date, cycle_id, week_no, day_no, type_, sleep_h, bodyweight, rpe,
+             status, legacy_note, planned_notes, actual_notes])
         sid = cur.lastrowid
     conn.commit()
     conn.close()
     return sid
+
+def get_body_metric(date):
+    """读取某日身体指标；不存在返回空骨架。"""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM body_metrics WHERE date=?", [date]).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {"date": date, "weight": None, "sleep_h": None,
+            "resting_hr": None, "hrv_ms": None, "notes": ""}
 
 def merge_session_sets(session_id, payload):
     """合并式录入组数据, 绝不删除计划组。
@@ -279,6 +413,16 @@ def merge_session_sets(session_id, payload):
         if len(groups) < len(planned_rows):
             for r in planned_rows[len(groups):]:
                 conn.execute("UPDATE sets SET status='skipped' WHERE id=? AND status='planned'", [r['id']])
+        # 实际记录写入后同步课状态，避免 sets 已有 actual 但 session 仍是 planned。
+        counts = conn.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN actual_reps IS NOT NULL OR actual_kg IS NOT NULL
+                            THEN 1 ELSE 0 END) AS actual
+            FROM sets WHERE session_id=?
+        """, [session_id]).fetchone()
+        if (counts["actual"] or 0) > 0:
+            execution_status = "done" if (counts["actual"] or 0) >= (counts["total"] or 0) else "partial"
+            conn.execute("UPDATE sessions SET status=? WHERE id=?", [execution_status, session_id])
     conn.commit()
     conn.close()
 
@@ -312,11 +456,23 @@ def insert_cycle(start, end, phase, goals_json='[]', notes=''):
     conn.close()
     return cid
 
-def insert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None, bodyweight=None, rpe=None, status='planned', notes=''):
+def insert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None,
+                   bodyweight=None, rpe=None, status='planned', notes='',
+                   planned_notes=None, actual_notes=None):
     conn = get_db()
+    legacy_note = notes if notes not in (None, "") else None
+    planned_note_value = planned_notes
+    if planned_note_value is None and status not in ("done", "partial"):
+        planned_note_value = legacy_note
+    actual_note_value = actual_notes
+    if actual_note_value is None and status in ("done", "partial"):
+        actual_note_value = legacy_note
     cur = conn.execute(
-        "INSERT OR REPLACE INTO sessions(date,cycle_id,week_no,day_no,type,sleep_h,bodyweight,rpe,status,notes) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        [date, cycle_id, week_no, day_no, type_, sleep_h, bodyweight, rpe, status, notes]
+        """INSERT OR REPLACE INTO sessions(date,cycle_id,week_no,day_no,type,sleep_h,bodyweight,rpe,
+                                           status,notes,planned_notes,actual_notes)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        [date, cycle_id, week_no, day_no, type_, sleep_h, bodyweight, rpe,
+         status, legacy_note, planned_note_value, actual_note_value]
     )
     conn.commit()
     sid = cur.lastrowid
@@ -341,11 +497,19 @@ def insert_cardio(session_id, kind, planned_json='{}', actual_json='{}', distanc
     conn.commit()
     conn.close()
 
-def insert_body_metric(date, weight=None, sleep_h=None, resting_hr=None, notes=''):
+def insert_body_metric(date, weight=None, sleep_h=None, resting_hr=None,
+                       hrv_ms=None, notes=''):
     conn = get_db()
     conn.execute(
-        "INSERT OR REPLACE INTO body_metrics(date,weight,sleep_h,resting_hr,notes) VALUES(?,?,?,?,?)",
-        [date, weight, sleep_h, resting_hr, notes]
+        """INSERT INTO body_metrics(date,weight,sleep_h,resting_hr,hrv_ms,notes)
+           VALUES(?,?,?,?,?,?)
+           ON CONFLICT(date) DO UPDATE SET
+             weight=COALESCE(excluded.weight, body_metrics.weight),
+             sleep_h=COALESCE(excluded.sleep_h, body_metrics.sleep_h),
+             resting_hr=COALESCE(excluded.resting_hr, body_metrics.resting_hr),
+             hrv_ms=COALESCE(excluded.hrv_ms, body_metrics.hrv_ms),
+             notes=CASE WHEN excluded.notes != '' THEN excluded.notes ELSE body_metrics.notes END""",
+        [date, weight, sleep_h, resting_hr, hrv_ms, notes]
     )
     conn.commit()
     conn.close()

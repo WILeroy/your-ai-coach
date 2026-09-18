@@ -23,7 +23,8 @@ export function lineOptions(spec: LineViewSpec): echarts.EChartsOption {
       splitLine: { lineStyle: { color: SPLIT_COLOR } },
     },
     series: spec.series.map(s => ({
-      name: s.name, type: 'line' as const, data: s.data, smooth: true,
+      // 科学趋势图不使用曲线插值，避免视觉平滑制造不存在的中间峰值/谷值。
+      name: s.name, type: 'line' as const, data: s.data, smooth: false,
       connectNulls: !!spec.connect_nulls, symbolSize: 5,
       lineStyle: { width: 2 },
       ...(spec.mark_line ? {
@@ -32,6 +33,14 @@ export function lineOptions(spec: LineViewSpec): echarts.EChartsOption {
           lineStyle: { color: '#e0556a', type: 'dashed', width: 1 },
           label: { color: '#e0556a', fontSize: 10 },
           data: [{ yAxis: spec.mark_line }],
+        },
+      } : {}),
+      ...(spec.mark_area ? {
+        markArea: {
+          silent: true,
+          itemStyle: { color: 'rgba(86,184,129,0.07)' },
+          label: { color: AXIS_COLOR, fontSize: 9, position: 'insideTop' },
+          data: [[{ yAxis: spec.mark_area[0], name: '参考区间' }, { yAxis: spec.mark_area[1] }]],
         },
       } : {}),
     })),

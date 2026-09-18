@@ -31,6 +31,7 @@ onMounted(() => {
   store.loadStatus()
   store.loadSessions()
   store.loadHistory()
+  store.recoverPendingTurn()
 })
 
 watch(() => store.messages.length, async () => {

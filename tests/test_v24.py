@@ -35,8 +35,9 @@ def test_replace_day_plan_execute_replaces_all():
                               notes="改成腿", confirmed=True)
     assert r["status"] == "done" and r["new_type"] == "legs"
     conn = get_db()
-    s = conn.execute("SELECT type, notes FROM sessions WHERE id=?", [r["session_id"]]).fetchone()
-    assert s["type"] == "legs" and s["notes"] == "改成腿"
+    s = conn.execute("SELECT type, planned_notes, actual_notes FROM sessions WHERE id=?", [r["session_id"]]).fetchone()
+    assert s["type"] == "legs" and s["planned_notes"] == "改成腿"
+    assert s["actual_notes"] is None
     names = [row[0] for row in conn.execute("""
         SELECT e.name FROM sets st JOIN exercises e ON st.exercise_id=e.id
         WHERE st.session_id=?""", [r["session_id"]])]

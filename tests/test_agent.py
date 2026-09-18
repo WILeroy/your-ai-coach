@@ -23,8 +23,10 @@ def test_today_context_view_spec():
     from agent.tools import tool_get_today_context
     r = tool_get_today_context()
     assert r["today"] == datetime.now().strftime("%Y-%m-%d")
-    assert r["view_spec"]["view"] == "metric_cards"
+    assert r["view_spec"]["view"] == "insight"
     assert isinstance(r["view_spec"]["cards"], list)
+    assert r["view_spec"]["evidence"]
+    assert r["view_spec"]["caveats"] is not None
 
 
 def test_exercise_history_exact():

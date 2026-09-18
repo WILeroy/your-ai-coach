@@ -33,7 +33,7 @@ def _exec_key(action):
 
 # 写入意图检测(完成时态/记录类动词)，用于 flash 模型漏调写工具时的纠正
 _WRITE_INTENT_RE = re.compile(
-    r"练完|做完|做[了完]\d|完成了|记录|记一下|记了|睡了\s*\d|睡\s*\d+\s*小时|体重\s*\d|晨脉\s*\d"
+    r"练完|做完|做[了完]\d|完成了|记录|记一下|记了|睡了\s*\d|睡\s*\d+\s*小时|体重\s*\d|静息心率\s*\d|晨脉\s*\d|HRV\s*\d|hrv\s*\d"
     r"|生成.{0,6}周期|删除|删掉|改成|调整.{0,6}计划")
 _WRITE_TOOLS = {"log_training", "log_body_metric", "update_session", "delete_data",
                 "create_plan", "adjust_plan", "manage_exercises"}
@@ -200,7 +200,7 @@ def _agent_loop(messages, tool_calls_log, session_id, user_text, _retryed=False)
 
 
 def _summarize_fallback(messages, tool_calls_log):
-    """工具轮耗尽仍无文字时，强制无工具总结；空响应重试一次，仍空则拼接工具结果"""
+    """工具轮耗尽仍无文字时，强制无工具总结；失败后压缩上下文再试，绝不输出原始JSON。"""
     if not tool_calls_log:
         return ""
     import copy
@@ -215,13 +215,60 @@ def _summarize_fallback(messages, tool_calls_log):
             content = (resp.choices[0].message.content or "").strip()
             if content:
                 return content
-        except Exception:
+        except Exception as e:
+            print("[WARN] Agent总结兜底失败: %s" % str(e)[:200], flush=True)
             continue
-    # 兜底的兜底: 用工具结果拼一个摘要，绝不返回空
+
+    # 微信/弱网场景下，完整工具上下文可能过长或触发服务商空响应。
+    # 第三次降级为“用户问题 + 压缩工具结果”的普通消息，绕开 tool-call 上下文。
+    try:
+        compact = _compact_summary_messages(messages)
+        resp = chat(compact, tools=None, max_tokens=700)
+        content = (resp.choices[0].message.content or "").strip()
+        if content:
+            return content
+    except Exception as e:
+        print("[WARN] Agent压缩总结兜底失败: %s" % str(e)[:200], flush=True)
+
+    # 兜底的兜底: 只给可读状态，不再把半截JSON当作回复暴露给用户。
     parts = []
     for t in tool_calls_log[-4:]:
-        parts.append("[%s] %s" % (t["tool"], t["result_preview"][:120]))
-    return "查询完成：\n" + "\n".join(parts)
+        args = t.get("args") or {}
+        scope = ""
+        if isinstance(args, dict):
+            scope = " ".join(str(v) for v in args.values() if isinstance(v, (str, int, float)))[:60]
+        parts.append("%s%s" % (t["tool"], "：%s" % scope if scope else ""))
+    return ("查询已完成，右侧画布已保留可视化结果；但自动总结暂时失败。"
+            "已读取：%s。请稍后重新提问，我会基于最新数据再生成简明建议。" % "、".join(parts))
+
+
+def _compact_summary_messages(messages, char_limit=5000):
+    """把工具调用轮压成普通用户消息，避免复杂 tool-call 上下文导致最终总结为空。"""
+    user_text = next((m.get("content", "") for m in reversed(messages)
+                      if m.get("role") == "user"), "")
+    tool_results = []
+    for m in reversed(messages):
+        if len(tool_results) >= 4:
+            break
+        if m.get("role") != "tool":
+            continue
+        raw = m.get("content", "")
+        try:
+            obj = json.loads(raw)
+            # 可视化协议很大但对文字总结无价值，压缩时优先丢弃。
+            if isinstance(obj, dict):
+                obj.pop("view_spec", None)
+            raw = json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            pass
+        tool_results.append(raw[:1500])
+    joined = "\n".join(reversed(tool_results))[:char_limit]
+    return [
+        {"role": "system", "content": "你是体能教练FIT。必须用简洁中文直接回答，不编造缺失数据。"},
+        {"role": "user", "content": (
+            "用户问题：%s\n\n工具结果(JSON，可能截断)：\n%s\n\n"
+            "请根据以上结果给用户3-6条要点，包含关键结论和下一步建议。" % (user_text, joined))},
+    ]
 
 
 # ═══════════════ 确认流程 ═══════════════

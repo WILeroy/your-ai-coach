@@ -6,7 +6,10 @@ export const useChatStore = defineStore('chat', {
     sessionId: localStorage.getItem('fit_chat_session') || '',
     messages: [] as ChatMessage[],
     views: [] as ViewSpec[],
+    activeViewIndex: -1,
+    refreshToken: 0,
     sending: false,
+    recoveringTurn: false,
     status: { configured: false, model: '', base_url: '' },
     sessions: [] as { session_id: string; title: string; last_at: string; msg_count: number }[],
   }),
@@ -16,6 +19,62 @@ export const useChatStore = defineStore('chat', {
         const r = await fetch('/api/chat/status')
         if (r.ok) this.status = await r.json()
       } catch {}
+    },
+    markPendingTurn(sessionId: string, message: string) {
+      localStorage.setItem('fit_pending_turn', JSON.stringify({
+        sessionId,
+        message,
+        startedAt: Date.now(),
+      }))
+    },
+    clearPendingTurn() {
+      localStorage.removeItem('fit_pending_turn')
+      this.recoveringTurn = false
+    },
+    async recoverPendingTurn() {
+      let pending: { sessionId?: string; message?: string; startedAt?: number }
+      try {
+        pending = JSON.parse(localStorage.getItem('fit_pending_turn') || 'null') || {}
+      } catch {
+        pending = {}
+      }
+      const sid = pending.sessionId
+      const message = pending.message || ''
+      if (!sid || !message) return
+      // 超过2分钟的轮次视为终止，避免无限等待。
+      if (!pending.startedAt || Date.now() - pending.startedAt > 120_000) {
+        this.clearPendingTurn()
+        return
+      }
+
+      this.recoveringTurn = true
+      this.sessionId = sid
+      localStorage.setItem('fit_chat_session', sid)
+      this.messages = [
+        { role: 'user', content: message },
+        { role: 'assistant', content: '网络重连中：服务端正在完成上一轮，完成后自动显示结果…', streaming: true, toolTags: [] },
+      ]
+      let elapsed = 0
+      const poll = window.setInterval(async () => {
+        elapsed += 2000
+        await this.loadHistory(sid)
+        const userIdx = [...this.messages].reverse().findIndex(m => m.role === 'user' && m.content === message)
+        const absoluteIdx = userIdx >= 0 ? this.messages.length - 1 - userIdx : -1
+        if (absoluteIdx >= 0 && this.messages.length > absoluteIdx + 1) {
+          window.clearInterval(poll)
+          this.clearPendingTurn()
+          this.loadSessions()
+          return
+        }
+        if (elapsed >= 120_000) {
+          window.clearInterval(poll)
+          this.clearPendingTurn()
+          this.messages = [
+            { role: 'user', content: message },
+            { role: 'assistant', content: '恢复超时：服务端没有保存上一轮结果，请重新发送。', toolTags: [] },
+          ]
+        }
+      }, 2000)
     },
     async loadSessions() {
       try {
@@ -35,6 +94,40 @@ export const useChatStore = defineStore('chat', {
             this.sessionId = id
             localStorage.setItem('fit_chat_session', id)
           }
+          // 弱网/刷新时，写操作可能已生成pending但尚未写chat_messages。
+          // 从SQLite恢复确认卡，避免用户永远无法点击确认。
+          try {
+            const pr = await fetch(`/api/chat/pending?session_id=${encodeURIComponent(id)}`)
+            if (pr.ok) {
+              const pending = await pr.json()
+              if (pending?.action_id) {
+                const confirm: PendingConfirm = {
+                  action_id: pending.action_id,
+                  tool: pending.actions?.[0]?.tool || '',
+                  preview: pending.actions?.[0]?.preview || {},
+                  actions: pending.actions || [],
+                }
+                let restored = [...(msgs.length ? msgs : this.messages)]
+                const userText = pending.user_text || ''
+                const userIdx = restored.map(m => m.content).lastIndexOf(userText)
+                const alreadyPending = userIdx >= 0 &&
+                  restored[userIdx + 1]?.confirm?.action_id === pending.action_id
+                if (!alreadyPending) {
+                  if (userText && (userIdx < 0 || restored.length === userIdx + 1)) {
+                    if (userIdx < 0) restored.push({ role: 'user', content: userText })
+                    restored.push({ role: 'assistant', content: '', confirm })
+                  } else {
+                    const last = restored[restored.length - 1]
+                    if (last) last.confirm = confirm
+                    else restored.push({ role: 'assistant', content: '', confirm })
+                  }
+                }
+                this.messages = restored
+                this.sessionId = id
+                localStorage.setItem('fit_chat_session', id)
+              }
+            }
+          } catch {}
         }
       } catch {}
     },
@@ -42,6 +135,7 @@ export const useChatStore = defineStore('chat', {
       this.sessionId = ''
       this.messages = []
       this.views = []
+      this.activeViewIndex = -1
       localStorage.removeItem('fit_chat_session')
     },
     async deleteSession(sid: string) {
@@ -68,14 +162,27 @@ export const useChatStore = defineStore('chat', {
       this.sessionId = sid
       localStorage.setItem('fit_chat_session', sid)
       this.views = []
+      this.activeViewIndex = -1
       this.loadHistory(sid)
     },
     pushView(spec: ViewSpec) {
       if (spec.view === 'refresh') return  // handled by pages via store
       if (spec.view === 'navigate') return // handled in send loop
-      // keep last 4 views, newest first
+      // Product form: newest result is active; recent results remain selectable history.
       this.views.unshift(spec)
-      if (this.views.length > 4) this.views.pop()
+      if (this.views.length > 12) this.views.pop()
+      this.activeViewIndex = 0
+    },
+    selectView(i: number) {
+      this.activeViewIndex = i
+    },
+    showBrief() {
+      this.activeViewIndex = -1
+    },
+    refreshCanvas() {
+      // Writes return to the refreshed daily brief so users see the persisted result.
+      this.activeViewIndex = -1
+      this.refreshToken++
     },
     async send(text: string, onNavigate?: (page: string) => void) {
       const content = text.trim()
@@ -87,12 +194,20 @@ export const useChatStore = defineStore('chat', {
       const idx = this.messages.push(streamMsg) - 1
       let streamText = ''
       let tags: { name: string; error?: boolean }[] = []
+      let finished = false
+      // 客户端先生成session id：即使fetch在微信网络切换时还没收到首包，也能恢复本轮。
+      const requestSessionId = this.sessionId || (
+        Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+      )
+      this.sessionId = requestSessionId
+      localStorage.setItem('fit_chat_session', requestSessionId)
+      this.markPendingTurn(requestSessionId, content)
 
       try {
         const resp = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: content, session_id: this.sessionId || undefined }),
+          body: JSON.stringify({ message: content, session_id: requestSessionId }),
         })
         if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`)
 
@@ -126,6 +241,7 @@ export const useChatStore = defineStore('chat', {
               case 'session':
                 this.sessionId = payload.session_id
                 localStorage.setItem('fit_chat_session', this.sessionId)
+                this.markPendingTurn(this.sessionId, content)
                 break
               case 'delta':
                 streamText += payload.text || ''
@@ -140,7 +256,8 @@ export const useChatStore = defineStore('chat', {
                 updateStream()
                 break
               case 'ui':
-                if (payload.view === 'navigate' && onNavigate) onNavigate(payload.page)
+                if (payload.view === 'refresh') this.refreshCanvas()
+                else if (payload.view === 'navigate' && onNavigate) onNavigate(payload.page)
                 else if (payload.view !== 'refresh') this.pushView(payload)
                 break
               case 'pending_confirm': {
@@ -155,11 +272,15 @@ export const useChatStore = defineStore('chat', {
                 break
               }
               case 'done':
+                finished = true
+                this.clearPendingTurn()
                 streamText = payload.reply || streamText
                 this.messages[idx] = { ...this.messages[idx], streaming: false }
                 updateStream()
                 break
               case 'error':
+                finished = true
+                this.clearPendingTurn()
                 streamText += `\n\n❌ ${payload.message || '出错了'}`
                 this.messages[idx] = { ...this.messages[idx], streaming: false }
                 updateStream()
@@ -171,8 +292,10 @@ export const useChatStore = defineStore('chat', {
           content: streamText || this.messages[idx].content || (this.messages[idx].confirm ? '' : '(空回复，请重试)') }
       } catch (e: any) {
         this.messages[idx] = { ...this.messages[idx], streaming: false,
-          content: streamText || `网络出错: ${e.message || '请重试'}` }
+          content: streamText || `网络中断: 服务端会继续完成本轮；重新进入页面后会自动恢复结果。 (${e.message || '连接已断开'})` }
       } finally {
+        // 网络中断时保留pending标记，等待后台写入后由恢复轮询读回。
+        if (finished) this.clearPendingTurn()
         this.sending = false
         this.loadSessions()
       }
@@ -223,7 +346,8 @@ export const useChatStore = defineStore('chat', {
                 updateStream()
                 break
               case 'ui':
-                if (payload.view !== 'navigate' && payload.view !== 'refresh') this.pushView(payload)
+                if (payload.view === 'refresh') this.refreshCanvas()
+                else if (payload.view !== 'navigate' && payload.view !== 'refresh') this.pushView(payload)
                 break
               case 'done':
                 streamText = payload.reply || streamText

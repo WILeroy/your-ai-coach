@@ -148,5 +148,6 @@ def test_canvas_default_endpoint():
     assert "today" in d and "weekday" in d
     views = d["views"]
     assert len(views) >= 2
-    assert views[0]["view"] == "metric_cards"
+    assert views[0]["view"] == "insight"
+    assert views[0]["evidence"]
     assert views[1]["view"] == "table"

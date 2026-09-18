@@ -14,6 +14,13 @@ const TOOL_LABELS: Record<string, string> = {
 
 interface ActionItem { tool: string; preview: Record<string, unknown> }
 
+const FIELD_LABELS: Record<string, string> = {
+  weight: '体重',
+  sleep_h: '睡眠',
+  resting_hr: '静息心率',
+  hrv_ms: 'HRV(ms)',
+}
+
 const items = computed<ActionItem[]>(() => {
   if (props.confirm.actions?.length) return props.confirm.actions
   return [{ tool: props.confirm.tool, preview: props.confirm.preview }]
@@ -23,19 +30,42 @@ const multi = computed(() => items.value.length > 1)
 
 function rows(preview: Record<string, unknown>): [string, string][] {
   const out: [string, string][] = []
+  if (preview.merge_rule && preview.existing && preview.result) {
+    const old = preview.existing as Record<string, unknown>
+    const result = preview.result as Record<string, unknown>
+    const changedFields = new Set(preview.changed_fields as string[] || [])
+    for (const [field, label] of [
+      ['weight', '体重'], ['sleep_h', '睡眠'],
+      ['resting_hr', '静息心率'], ['hrv_ms', 'HRV'],
+    ] as [string, string][]) {
+      if (changedFields.has(field)) {
+        out.push([label, `${old[field] ?? '—'} → ${result[field] ?? '—'}（本次变更）`])
+      }
+    }
+    if (changedFields.has('notes')) out.push(['备注', '（本次变更）'])
+    out.push(['本次变更', `${changedFields.size}项`])
+    out.push(['合并规则', String(preview.merge_rule)])
+    return out
+  }
   for (const [k, v] of Object.entries(preview || {})) {
     if (k === 'sets_summary' && Array.isArray(v)) {
       out.push(['动作', v.map((s: any) => {
         const g = (s.groups || []).join(' / ')
-        return `${s.exercise}: ${g}${s.exists_in_db === false ? ' ⚠️库外动作' : ''}`
+        const name = s.input_name && s.input_name !== s.exercise ? `${s.input_name} → ${s.exercise}` : s.exercise
+        const mark = s.exists_in_db === false ? '（确认后自动新增）'
+          : s.resolution === 'alias' ? '（别名归并）'
+          : s.resolution === 'fuzzy' ? '（高置信匹配）' : ''
+        return `${name}: ${g}${mark}`
       }).join('\n')])
-    } else if (k === 'missing_exercises' && Array.isArray(v)) {
-      out.push(['缺失动作', v.map((m: any) =>
-        `${m.name}(${m.suggested_pattern})`).join('、')])
+    } else if (k === 'new_exercises' && Array.isArray(v)) {
+      out.push(['自动新增', v.map((m: any) => `${m.name} / ${m.suggested_pattern || 'accessory'}`).join('、')])
+    } else if (k === 'missing_exercises') {
+      // new_exercises 已经以“确认后自动新增”展示，避免重复/误导。
+      continue
     } else if (typeof v === 'object' && v !== null) {
       out.push([k, JSON.stringify(v)])
     } else if (v !== null && v !== undefined && v !== '') {
-      out.push([k, String(v)])
+      out.push([FIELD_LABELS[k] || k, String(v)])
     }
   }
   return out

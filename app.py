@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Flask 主应用 v2: 口令认证 + Vue SPA 托管 + JSON API + SSE流式聊天"""
 import sys, os, json, uuid, secrets
+import queue
+import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from flask import (Flask, jsonify, request, Response, stream_with_context,
-                   send_from_directory)
+from flask import Flask, jsonify, request, Response, send_from_directory
 from datetime import timedelta
 
 from db import (get_db, get_session_detail, get_all_sessions, get_all_exercises,
@@ -114,6 +115,18 @@ def api_canvas_default():
         views.append({"view": "table", "title": "今日无训练计划 💤",
                       "columns": [{"key": "提示", "label": "提示"}],
                       "rows": [{"提示": "今天没有安排训练，好好休息"}]})
+    # 科学呈现第二层：不仅给今日清单，还给带窗口/阈值/局限说明的负荷筛查。
+    acwr = [x for x in compute_acwr() if x["date"] >= ctx["today"][:8] + "01"]
+    if acwr:
+        ratio_series = [x["ratio"] for x in acwr]
+        views.append({
+            "view": "line", "title": "本月 ACWR 负荷筛查",
+            "x": [x["date"][5:] for x in acwr],
+            "series": [{"name": "ACWR", "data": ratio_series}],
+            "y_name": "7d / 28d", "mark_line": 1.3, "mark_area": [0.8, 1.3],
+            "note": "0.8-1.3为常用筛查区间；样本不足时曲线为空。训练时长缺失时按组数估算，不能替代主观疲劳与生活压力判断。",
+            "window": "本月", "confidence": "medium"
+        })
     return jsonify({"views": views, "today": ctx["today"], "weekday": ctx["weekday"]})
 
 
@@ -150,6 +163,16 @@ def api_chat_history():
     return jsonify([{"role": r['role'], "content": r['content']} for r in rows])
 
 
+@app.route("/api/chat/pending")
+def api_chat_pending():
+    """页面刷新/弱网重连后恢复未完成确认卡(只读，不消费pending)"""
+    sid = request.args.get('session_id', '')
+    if not sid:
+        return jsonify({"error": "session_id required"}), 400
+    from agent.tools import peek_pending_detail
+    return jsonify(peek_pending_detail(sid) or {})
+
+
 @app.route("/api/chat/sessions/<sid>", methods=["DELETE"])
 def api_chat_delete_session(sid):
     """删除单个会话(消息+关联pending)"""
@@ -172,9 +195,45 @@ def api_chat_delete_all_sessions():
     return jsonify({"ok": True, "deleted_messages": n1})
 
 
-def _sse_response(gen):
+def _sse_response(gen, heartbeat_interval=15):
+    """SSE外层心跳 + 后台完成保护。
+
+    微信WebView在WiFi/4G切换或锁屏时可能断开Response消费者。生产者线程会继续把
+    Agent轮次跑完并写入SQLite；HTTP层每15秒发送SSE comment，避免移动端空闲断流。
+    """
+    events = queue.SimpleQueue()
+    SENTINEL = object()
+
+    def produce():
+        try:
+            # 这里的gen只使用已捕获参数，不读取request；放入生产者线程可让
+            #客户端断开后仍继续写SQLite，因此不需要stream_with_context。
+            for event in gen:
+                events.put(event)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            events.put("event: error\ndata: %s\n\n" % json.dumps(
+                {"message": str(e)[:200]}, ensure_ascii=False))
+        finally:
+            events.put(SENTINEL)
+
+    threading.Thread(target=produce, name="fit-sse-worker", daemon=True).start()
+
+    def heartbeat():
+        while True:
+            try:
+                item = events.get(timeout=heartbeat_interval)
+            except queue.Empty:
+                # SSE comment对前端是透明心跳，可穿透部分移动网关的空闲超时。
+                yield ": keep-alive\n\n"
+                continue
+            if item is SENTINEL:
+                break
+            yield item
+
     return Response(
-        stream_with_context(gen),
+        heartbeat(),
         mimetype='text/event-stream',
         headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
     )
@@ -365,7 +424,7 @@ def api_log():
     sid = upsert_session(
         date, data.get("cycle_id"), data.get("week_no"), data.get("day_no"),
         stype, data.get("sleep_h"), data.get("bodyweight"), data.get("rpe"),
-        "done", data.get("notes", ""))
+        "done", actual_notes=data.get("notes"))
 
     payload = []
     for s in data.get("sets", []):
@@ -400,7 +459,8 @@ def api_body_metrics():
     from db import insert_body_metric
     backup_db_if_new_day()
     insert_body_metric(data["date"], data.get("weight"), data.get("sleep_h"),
-                       data.get("resting_hr"), data.get("notes", ""))
+                       data.get("resting_hr"), data.get("hrv_ms"),
+                       data.get("notes", ""))
     return jsonify({"status": "ok"})
 
 
