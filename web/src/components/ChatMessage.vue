@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import type { ChatMessage } from '../types'
 import ConfirmCard from './ConfirmCard.vue'
 
@@ -10,9 +11,11 @@ const props = defineProps<{ msg: ChatMessage }>()
 const rendered = computed(() => {
   if (props.msg.role === 'user') return ''
   try {
-    return marked.parse(props.msg.content || '', { async: false }) as string
+    const html = marked.parse(props.msg.content || '', { async: false }) as string
+    // 助手内容可能回显网页抓取/用户输入，marked 不转义原始HTML，必须消毒防XSS。
+    return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } })
   } catch {
-    return props.msg.content
+    return DOMPurify.sanitize(props.msg.content)
   }
 })
 

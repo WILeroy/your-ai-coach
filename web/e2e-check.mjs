@@ -1,11 +1,12 @@
 import { chromium } from 'playwright-core'
 const PW = process.env.FIT_PW
-const browser = await chromium.launch()
+const BASE = process.env.FIT_BASE_URL || 'https://127.0.0.1'
+const browser = await chromium.launch({ args: ['--ignore-certificate-errors'] })
 const page = await browser.newPage({ viewport: { width: 1380, height: 850 } })
 const results = []
 const check = (name, ok) => { results.push([name, ok]); console.log((ok ? '✅' : '❌') + ' ' + name) }
 
-await page.goto('http://127.0.0.1:5200/login', { waitUntil: 'networkidle' })
+await page.goto(`${BASE}/login`, { waitUntil: 'networkidle' })
 check('登录页渲染', await page.locator('input[type=password]').isVisible())
 await page.fill('input[type=password]', PW)
 await page.click('button[type=submit]')
@@ -77,7 +78,7 @@ const after = await page.locator('.session-item').count()
 check('会话删除(列表减少+重置)', after === before - 1 && (await page.locator('.msg').count()) <= 1)
 
 // 旧路由回退到 coach
-await page.goto('http://127.0.0.1:5200/trends', { waitUntil: 'networkidle' })
+await page.goto(`${BASE}/trends`, { waitUntil: 'networkidle' })
 await page.waitForTimeout(600)
 check('旧路由回退教练页', page.url().includes('/coach'))
 

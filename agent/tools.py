@@ -304,16 +304,27 @@ def _match_exercise(name):
 
 
 def _preview_or_execute(confirmed, build_preview, execute):
-    """通用确认流程: 未确认返回预览，已确认执行(先备份)"""
+    """通用确认流程: 未确认返回预览，已确认执行(先备份)。
+
+    结果协议(与系统提示第7条一致):
+      - status=pending: 待用户确认，只含预览
+      - status=done:    真正写入成功，附带 ui_refresh
+      - status=error:   执行失败/业务校验拒绝。绝不能携带 status=done 或 ui_refresh，
+                        否则模型会把失败回复成"已保存"。
+    """
     if not confirmed:
         return {"status": "pending", "action_id": uuid.uuid4().hex[:8],
                 "preview": build_preview()}
     try:
         backup_db_if_new_day()
         result = execute()
-        return {"status": "done", "ui_refresh": True, **result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
+    if not isinstance(result, dict):
+        result = {"result": result}
+    if result.get("error"):
+        return {"status": "error", **result}
+    return {"status": "done", "ui_refresh": True, **result}
 
 
 def _weeks_ago(weeks):

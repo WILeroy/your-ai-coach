@@ -326,7 +326,8 @@ def _handle_confirm(action_id, session_id, confirmed):
         result_str = json.dumps(result, ensure_ascii=False, default=str)
         tool_calls_log.append({"tool": fn_name, "args": fn_args,
                                "result_preview": result_str[:300]})
-        if isinstance(result, dict) and result.get("status") == "error":
+        # 双保险: 新协议返回 status=error；历史/未知工具可能只带 error 键。
+        if isinstance(result, dict) and (result.get("status") == "error" or result.get("error")):
             fail_count += 1
         else:
             ok_count += 1

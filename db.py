@@ -459,6 +459,12 @@ def insert_cycle(start, end, phase, goals_json='[]', notes=''):
 def insert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None,
                    bodyweight=None, rpe=None, status='planned', notes='',
                    planned_notes=None, actual_notes=None):
+    """插入训练课；若 (date,type) 已存在则做字段合并更新。
+
+    安全约束: 绝不能使用 INSERT OR REPLACE。SQLite 的 REPLACE 会先删除冲突旧行，
+    而 sets/cardio 对 sessions 是 ON DELETE CASCADE，旧实现会把该课全部组数据
+    级联清空(create_plan 覆盖已有日期时触发真实数据丢失)。
+    """
     conn = get_db()
     legacy_note = notes if notes not in (None, "") else None
     planned_note_value = planned_notes
@@ -467,15 +473,30 @@ def insert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None,
     actual_note_value = actual_notes
     if actual_note_value is None and status in ("done", "partial"):
         actual_note_value = legacy_note
-    cur = conn.execute(
-        """INSERT OR REPLACE INTO sessions(date,cycle_id,week_no,day_no,type,sleep_h,bodyweight,rpe,
-                                           status,notes,planned_notes,actual_notes)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-        [date, cycle_id, week_no, day_no, type_, sleep_h, bodyweight, rpe,
-         status, legacy_note, planned_note_value, actual_note_value]
-    )
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE date=? AND type=?", [date, type_]).fetchone()
+    if row:
+        sid = row['id']
+        conn.execute("""
+            UPDATE sessions SET
+              cycle_id=COALESCE(?,cycle_id), week_no=COALESCE(?,week_no), day_no=COALESCE(?,day_no),
+              sleep_h=COALESCE(?,sleep_h), bodyweight=COALESCE(?,bodyweight), rpe=COALESCE(?,rpe),
+              status=?, notes=COALESCE(?,notes),
+              planned_notes=COALESCE(?,planned_notes), actual_notes=COALESCE(?,actual_notes)
+            WHERE id=?""",
+            [cycle_id, week_no, day_no, sleep_h, bodyweight, rpe, status,
+             legacy_note,
+             planned_note_value if planned_note_value not in (None, "") else None,
+             actual_note_value if actual_note_value not in (None, "") else None, sid])
+    else:
+        cur = conn.execute(
+            """INSERT INTO sessions(date,cycle_id,week_no,day_no,type,sleep_h,bodyweight,rpe,
+                                   status,notes,planned_notes,actual_notes)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [date, cycle_id, week_no, day_no, type_, sleep_h, bodyweight, rpe,
+             status, legacy_note, planned_note_value, actual_note_value])
+        sid = cur.lastrowid
     conn.commit()
-    sid = cur.lastrowid
     conn.close()
     return sid
 

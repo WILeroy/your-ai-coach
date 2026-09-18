@@ -16,7 +16,21 @@ cd web && npm install && npm run build && cd ..
 ./start.sh
 ```
 
-默认访问 `http://服务器IP:5200`。公网部署请使用强口令，并建议增加 HTTPS 反向代理。
+服务只监听 `127.0.0.1:5200`，公网访问统一走 nginx HTTPS 反向代理：
+
+```bash
+sudo apt-get install -y nginx
+sudo cp deploy/nginx-fit-ai-coach.conf /etc/nginx/sites-available/fit-ai-coach
+sudo ln -sf /etc/nginx/sites-available/fit-ai-coach /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+# 然后在 .env 设置 COOKIE_SECURE=true 并 ./start.sh restart
+```
+
+无域名时默认使用自签证书（浏览器会提示一次风险确认）；绑定域名后可用
+`sudo certbot --nginx -d 你的域名` 换成受信证书。
+
+安全约定：`X-Forwarded-For` 只在请求来自 `TRUSTED_PROXIES`（默认 `127.0.0.1,::1`）时生效，
+直连客户端伪造该头无法绕过登录限速。
 
 ## 必要配置
 

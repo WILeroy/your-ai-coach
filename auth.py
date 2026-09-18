@@ -10,6 +10,11 @@ MAX_FAILS = 5
 LOCK_MINUTES = 15
 SESSION_HOURS = 30 * 24
 
+# 只有来自这些反代地址的请求才信任 X-Forwarded-For。
+# 直连公网时该头完全可由客户端伪造，若盲信会按伪造IP分桶记录失败，
+# 使登录限速失效并允许无限爆破。逗号分隔，可用 TRUSTED_PROXIES 覆盖。
+DEFAULT_TRUSTED_PROXIES = "127.0.0.1,::1"
+
 
 def get_access_password():
     return os.environ.get("ACCESS_PASSWORD", "")
@@ -31,8 +36,13 @@ def _parse(s):
 
 
 def client_ip():
-    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-            or request.remote_addr or "unknown")
+    remote = request.remote_addr or "unknown"
+    trusted = {x.strip() for x in os.environ.get("TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES).split(",") if x.strip()}
+    if remote in trusted:
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return remote
 
 
 def is_locked(ip):

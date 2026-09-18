@@ -14,7 +14,8 @@ case "${1:-start}" in
       sleep 2
       echo "✅ 服务已启动"
     fi
-    echo "   访问: http://127.0.0.1:$PORT"
+    echo "   本地: http://127.0.0.1:$PORT (仅回环)"
+    echo "   公网: https://服务器IP (nginx反代，见 deploy/setup-https.sh)"
     echo "   日志: $(pwd)/gunicorn-access.log"
     echo "   状态: sudo systemctl status $SERVICE"
     ;;

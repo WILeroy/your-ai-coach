@@ -24,6 +24,10 @@ DIST_DIR = os.path.join(BASE_DIR, "web", "dist")
 app = Flask(__name__, static_folder=os.path.join(BASE_DIR, "static"))
 
 
+def _bool_env(name, default=False):
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _load_secret_key():
     path = os.path.join(BASE_DIR, ".secret_key")
     if os.path.exists(path):
@@ -39,6 +43,8 @@ app.secret_key = _load_secret_key()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    # HTTPS 反代部署时置 COOKIE_SECURE=true（.env），避免会话Cookie走明文链路。
+    SESSION_COOKIE_SECURE=_bool_env("COOKIE_SECURE"),
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
 )
 
@@ -513,4 +519,5 @@ if __name__ == "__main__":
     ok, msg = check_connectivity()
     if not ok:
         print("[WARN] LLM 连通性检查失败:", msg)
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5200)), debug=False)
+    # 本地开发只监听回环；公网访问统一走 nginx HTTPS 反代 -> 127.0.0.1:5200。
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 5200)), debug=False)
