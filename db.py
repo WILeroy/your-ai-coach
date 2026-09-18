@@ -153,8 +153,30 @@ def init_db():
     _migrate_session_notes(conn)
     _sync_builtin_exercise_aliases(conn)
     _repair_session_execution_status(conn)
+    _backfill_body_metrics_from_sessions(conn)
     conn.commit()
     conn.close()
+
+
+def _backfill_body_metrics_from_sessions(conn):
+    """把历史 sessions.sleep_h/bodyweight 幂等回填到 body_metrics。
+
+    每个日期取最新一条含身体指标的session，且只在 body_metrics 对应字段为空时
+    补入(COALESCE保留既有值)，重复执行无副作用。同日多条时按 MAX(id) 保证确定性。
+    """
+    conn.execute("""
+        INSERT INTO body_metrics(date, weight, sleep_h)
+        SELECT s.date, s.bodyweight, s.sleep_h
+        FROM sessions s
+        JOIN (SELECT date, MAX(id) AS id
+              FROM sessions
+              WHERE sleep_h IS NOT NULL OR bodyweight IS NOT NULL
+              GROUP BY date) latest ON latest.id = s.id
+        WHERE s.sleep_h IS NOT NULL OR s.bodyweight IS NOT NULL
+        ON CONFLICT(date) DO UPDATE SET
+          weight=COALESCE(body_metrics.weight, excluded.weight),
+          sleep_h=COALESCE(body_metrics.sleep_h, excluded.sleep_h)
+    """)
 
 
 def _migrate_session_notes(conn):
@@ -358,7 +380,27 @@ def upsert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None,
         sid = cur.lastrowid
     conn.commit()
     conn.close()
+    sync_daily_metrics_from_session(date, sleep_h, bodyweight)
     return sid
+
+
+def sync_daily_metrics_from_session(date, sleep_h=None, bodyweight=None):
+    """训练课携带的睡眠/体重同步为当日身体指标(body_metrics为日常指标唯一读取源)。
+
+    只补空不覆盖：log_body_metric 直接录入的值优先于随训练课带入的值；
+    两个字段均缺失时为空操作。需在调用方事务提交后执行，避免嵌套写锁。
+    """
+    if sleep_h is None and bodyweight is None:
+        return
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO body_metrics(date, weight, sleep_h) VALUES(?,?,?)
+        ON CONFLICT(date) DO UPDATE SET
+          weight=COALESCE(body_metrics.weight, excluded.weight),
+          sleep_h=COALESCE(body_metrics.sleep_h, excluded.sleep_h)
+    """, [date, bodyweight, sleep_h])
+    conn.commit()
+    conn.close()
 
 def get_body_metric(date):
     """读取某日身体指标；不存在返回空骨架。"""
@@ -498,6 +540,7 @@ def insert_session(date, cycle_id, week_no, day_no, type_, sleep_h=None,
         sid = cur.lastrowid
     conn.commit()
     conn.close()
+    sync_daily_metrics_from_session(date, sleep_h, bodyweight)
     return sid
 
 def insert_set(session_id, exercise_id, set_no, planned_kg=None, planned_reps=None, actual_kg=None, actual_reps=None, rpe=None, status='planned', notes=''):

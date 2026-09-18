@@ -460,8 +460,19 @@ def tool_get_today_context(**kwargs):
     metric_rows = [dict(r) for r in conn.execute(
         """SELECT date, weight, sleep_h, resting_hr, hrv_ms FROM body_metrics
            ORDER BY date DESC LIMIT 15""").fetchall()]
-    metric = metric_rows[0] if metric_rows else None
     conn.close()
+
+    # 身体指标按字段独立取值：体重/静息心率/HRV是"最近测量"，睡眠是"当日状态"。
+    # 旧实现取最新一整行，任一字段当日缺失就会显示"—"，并掩盖更早的可用记录。
+    def latest_row(field):
+        return next((r for r in metric_rows if r.get(field) is not None), None)
+
+    today_metric = next((r for r in metric_rows if r["date"] == today), None)
+    sleep_today = today_metric.get("sleep_h") if today_metric else None
+    weight_row = latest_row("weight")
+    hr_row = latest_row("resting_hr")
+    hrv_row = latest_row("hrv_ms")
+    any_metric = sleep_today is not None or any((weight_row, hr_row, hrv_row))
 
     # 完成统计拆成两个口径，避免把“记录数”误读成日历天或计划依从率：
     # 1) actual: done/partial 的非 rest 记录数，同日补录/替代会分别计数；
@@ -484,40 +495,50 @@ def tool_get_today_context(**kwargs):
                       "unit": "课", "sub": "截至今天的非休息周期计划；替代训练不计为原计划完成"})
 
     readiness_signals, caveats = [], []
-    if metric:
-        cards.append({"label": "体重", "value": metric['weight'], "unit": "kg",
-                      "sub": "记录日 %s；单日波动不宜解读为增肌/减脂" % metric['date']})
-        cards.append({"label": "睡眠", "value": metric['sleep_h'], "unit": "h",
-                      "sub": "参考范围7-9h", "reference": "7-9h"})
-        if metric['sleep_h'] is not None and metric['sleep_h'] < 6:
-            readiness_signals.append("最新睡眠%.1fh低于6h" % metric['sleep_h'])
-        historical_hr = [r['resting_hr'] for r in metric_rows[1:]
-                         if r['resting_hr'] is not None]
-        if metric['resting_hr'] is not None and historical_hr:
+    if weight_row:
+        cards.append({"label": "体重", "value": weight_row["weight"], "unit": "kg",
+                      "sub": "记录日 %s；单日波动不宜解读为增肌/减脂" % weight_row["date"]})
+    if sleep_today is not None:
+        cards.append({"label": "睡眠", "value": sleep_today, "unit": "h",
+                      "sub": "今日记录；参考范围7-9h", "reference": "7-9h"})
+        if sleep_today < 6:
+            readiness_signals.append("今日睡眠%.1fh低于6h" % sleep_today)
+    else:
+        cards.append({"label": "睡眠", "value": "未记录", "unit": "",
+                      "sub": "对话补录：昨晚睡了7.5小时"})
+        caveats.append("今日睡眠未记录，恢复判断证据不足")
+
+    def field_baseline(row, field):
+        idx = metric_rows.index(row)
+        return [r[field] for r in metric_rows[idx + 1:] if r.get(field) is not None]
+
+    if hr_row:
+        historical_hr = field_baseline(hr_row, "resting_hr")
+        if historical_hr:
             baseline = sum(historical_hr) / len(historical_hr)
-            delta_pct = (metric['resting_hr'] - baseline) / baseline * 100
-            cards.append({"label": "静息心率", "value": metric['resting_hr'], "unit": "bpm",
-                          "sub": "较近%d次均值%+.0f%%" % (len(historical_hr), delta_pct),
+            delta_pct = (hr_row["resting_hr"] - baseline) / baseline * 100
+            cards.append({"label": "静息心率", "value": hr_row["resting_hr"], "unit": "bpm",
+                          "sub": "记录日 %s；较近%d次均值%+.0f%%" % (hr_row["date"], len(historical_hr), delta_pct),
                           "reference": "个人基线"})
             if delta_pct >= 7:
                 readiness_signals.append("静息心率较个人基线升高%.0f%%" % delta_pct)
-        elif metric['resting_hr'] is not None:
-            cards.append({"label": "静息心率", "value": metric['resting_hr'], "unit": "bpm",
-                          "sub": "历史样本不足，暂无个人基线"})
-        historical_hrv = [r['hrv_ms'] for r in metric_rows[1:]
-                          if r['hrv_ms'] is not None]
-        if metric['hrv_ms'] is not None and historical_hrv:
+        else:
+            cards.append({"label": "静息心率", "value": hr_row["resting_hr"], "unit": "bpm",
+                          "sub": "记录日 %s；历史样本不足，暂无个人基线" % hr_row["date"]})
+    if hrv_row:
+        historical_hrv = field_baseline(hrv_row, "hrv_ms")
+        if historical_hrv:
             hrv_baseline = sum(historical_hrv) / len(historical_hrv)
-            hrv_delta = (metric['hrv_ms'] - hrv_baseline) / hrv_baseline * 100
-            cards.append({"label": "HRV", "value": metric['hrv_ms'], "unit": "ms",
-                          "sub": "较近%d次均值%+.0f%%" % (len(historical_hrv), hrv_delta),
+            hrv_delta = (hrv_row["hrv_ms"] - hrv_baseline) / hrv_baseline * 100
+            cards.append({"label": "HRV", "value": hrv_row["hrv_ms"], "unit": "ms",
+                          "sub": "记录日 %s；较近%d次均值%+.0f%%" % (hrv_row["date"], len(historical_hrv), hrv_delta),
                           "reference": "个人基线"})
             if hrv_delta <= -15:
                 readiness_signals.append("HRV较个人基线下降%.0f%%" % abs(hrv_delta))
-        elif metric['hrv_ms'] is not None:
-            cards.append({"label": "HRV", "value": metric['hrv_ms'], "unit": "ms",
-                          "sub": "历史样本不足，暂无个人基线"})
-    else:
+        else:
+            cards.append({"label": "HRV", "value": hrv_row["hrv_ms"], "unit": "ms",
+                          "sub": "记录日 %s；历史样本不足，暂无个人基线" % hrv_row["date"]})
+    if not any_metric:
         caveats.append("尚未录入体重/睡眠/静息心率/HRV，恢复判断只基于训练记录")
 
     if not week_summary:
@@ -551,8 +572,8 @@ def tool_get_today_context(**kwargs):
 
     evidence = [
         {"label": "训练窗口", "value": "近7天", "detail": "实际完成=done/partial非rest记录；计划依从=截至今天已到期非rest周期计划，替代训练不冲抵原计划"},
-        {"label": "恢复输入", "value": "最新1次身体指标",
-         "detail": "静息心率/HRV基线=此前近14次可用记录均值；建议固定运动手表来源与时段。静息心率升高≥7%或HRV下降≥15%仅作为注意信号"},
+        {"label": "恢复输入", "value": "分字段身体指标",
+         "detail": "体重/静息心率/HRV各取最近一次可用记录并标注记录日；睡眠按当日口径，未记录不跨日回退。心率/HRV基线=此前近14次可用记录均值；心率升高≥7%或HRV下降≥15%仅作为注意信号"},
         {"label": "负荷模型", "value": "ACWR",
          "detail": "7天急性/28天慢性 sRPE；训练时长缺失时用组数×3分钟估算，属筛查而非诊断"},
     ]
@@ -569,7 +590,15 @@ def tool_get_today_context(**kwargs):
             "scheduled_completed": scheduled_completed,
             "definition": "actual counts done/partial non-rest records; adherence counts due scheduled non-rest sessions only",
         },
-        "latest_metric": dict(metric) if metric else None,
+        "latest_metric": {
+            "sleep_h": sleep_today, "sleep_date": today if sleep_today is not None else None,
+            "weight": weight_row["weight"] if weight_row else None,
+            "weight_date": weight_row["date"] if weight_row else None,
+            "resting_hr": hr_row["resting_hr"] if hr_row else None,
+            "resting_hr_date": hr_row["date"] if hr_row else None,
+            "hrv_ms": hrv_row["hrv_ms"] if hrv_row else None,
+            "hrv_date": hrv_row["date"] if hrv_row else None,
+        },
         "view_spec": {
             "view": "insight", "title": "训练决策简报 · %s %s" % (today, WEEKDAY_CN[date.today().weekday()]),
             "headline": headline, "status": status,
