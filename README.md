@@ -1,168 +1,45 @@
-# FIT · AI 体能教练 v2
+# FIT · AI 体能教练 v2.5
 
-以 **Agent 为核心**的本地训练助手：自然语言对话 → 工具调用 → 数据落库 → 可视化画布自动渲染。
+本地优先的 AI 训练教练：通过自然语言记录训练、查询趋势、调整课表，并自动生成可解释的右侧训练决策画布。数据保存在本机 SQLite，不依赖云数据库。
 
-## 架构
-
-```
-fit-ai-coach/
-├── app.py              # Flask: 认证 + SPA托管 + API + SSE
-├── auth.py             # 口令登录 + IP限速(SQLite持久化)
-├── db.py               # SQLite schema + 助手 (含每日自动备份)
-├── analytics.py        # 分析引擎 (e1RM/ACWR/平台期/依从性/减载)
-├── planner.py          # 周期计划生成
-├── agent/              # AI Agent
-│   ├── core.py         # Agent循环: 流式→工具→确认(SQLite持久化)→UI事件
-│   ├── tools.py        # 15个结构化工具 + view_spec可视化协议
-│   ├── context.py      # 精简系统提示词(~350 tokens, 含今日日期)
-│   ├── llm.py          # OpenAI兼容客户端(仅首token前重试)
-│   └── config.py       # .env 配置
-├── web/                # Vue3 + TS + Vite 前端
-│   └── src/pages/      # Coach(默认)/Dashboard/Trends/Review/Plan/Login
-├── scripts/agent_eval.py  # Agent回归评测
-├── tests/              # pytest 单元测试
-└── data/fitness.db     # 单文件数据库，拷贝即备份
-```
-
-## 部署
+## 快速开始
 
 ```bash
-# 1. 配置
+# 1. 配置密钥与登录口令
 cp .env.template .env
-# 编辑 .env: LLM_API_KEY / ACCESS_PASSWORD
+# 编辑 .env：LLM_API_KEY / ACCESS_PASSWORD
 
 # 2. 构建前端
 cd web && npm install && npm run build && cd ..
 
-# 3. 启动 (systemd, 开机自启)
-./start.sh          # http://服务器IP:5200
+# 3. 启动服务
+./start.sh
 ```
 
-## 配置 (.env)
+默认访问 `http://服务器IP:5200`。公网部署请使用强口令，并建议增加 HTTPS 反向代理。
 
-| 键 | 默认 | 说明 |
-|---|---|---|
-| LLM_API_KEY | - | DeepSeek 或任意 OpenAI 兼容 Key |
-| LLM_BASE_URL | https://api.deepseek.com | |
-| LLM_MODEL | deepseek-flash | DeepSeek V4.1 Flash |
-| LLM_MAX_TOKENS | 2048 | |
-| AGENT_MAX_TOOL_ROUNDS | 6 | |
-| ACCESS_PASSWORD | - | Web 登录口令，必填 |
+## 必要配置
 
-## Agent 工作循环
+| 键 | 说明 |
+|---|---|
+| `LLM_API_KEY` | OpenAI 兼容 API Key |
+| `LLM_BASE_URL` | 默认 DeepSeek API |
+| `LLM_MODEL` | 默认 `deepseek-flash` |
+| `ACCESS_PASSWORD` | Web 登录口令，必填 |
 
-```
-用户: "深蹲趋势如何？"
-  → FIT 调用 get_exercise_history(深蹲)
-  → 工具返回数据 + view_spec
-  → 前端画布自动渲染 e1RM 曲线 (SSE "ui" 事件)
-  → FIT 输出文字解读
-
-用户: "练完了，深蹲65kg 5×5"
-  → FIT 调用 log_training(预览)
-  → 前端弹出确认卡片
-  → 用户点"确认" → 落库 → 画布自动刷新
-```
-
-- **读工具**(免确认): get_today_context / get_exercise_history / get_sessions / get_analytics / get_plan / get_body_metrics / search_exercises
-- **写工具**(确认门控): log_training / update_session / delete_data / create_plan / adjust_plan / log_body_metric / manage_exercises
-- 确认状态存 SQLite，gunicorn 多 worker 安全；10分钟过期
-
-## 安全
-
-- 口令登录 + 会话Cookie (HttpOnly, SameSite=Lax)
-- 同IP 15分钟内 5 次登录失败锁定
-- 每日首次写入自动备份数据库到 data/fitness.db.bak-YYYYMMDD
-- 服务监听公网时，务必设置强口令；建议后续再加 HTTPS 反代
-
-## 开发
+## 开发与测试
 
 ```bash
-# 后端 (5201测试端口)
-.venv/bin/python -c "import app; app.app.run(port=5201)"
-
-# 前端热更新 (5173, 代理到5200)
+# 后端测试
+.venv/bin/python -m pytest tests -q
+# 前端类型检查与构建
+cd web && npm run build
+# 本地后端开发服务
+cd .. && .venv/bin/python -c "import app; app.app.run(port=5201)"
+# 前端热更新
 cd web && npm run dev
-
-# 测试
-.venv/bin/python -m pytest tests/ -q
-.venv/bin/python scripts/agent_eval.py   # 需API Key
 ```
 
-## CLI 数据录入
+## 数据与备份
 
-```bash
-python cli.py log 2026-09-16 legs --rpe 8 --sleep 7
-python cli.py review
-```
-
-## E2E 测试 (Playwright)
-
-```bash
-cd web && npm install playwright-core --no-save && npx playwright install chromium
-FIT_PW=你的口令 node web/e2e-check.mjs
-```
-
-## v2.2 新增
-
-- **Agent 联网**：`web_search`（搜狗→360→必应多引擎免注册，自动解析真实链接）+ `web_fetch`（trafilatura 正文抽取，含 SSRF 防护）。问动作技术/营养/伤病/时效性问题时自动检索并在画布展示来源卡片
-- **会话管理**：历史抽屉支持单条删除（悬浮🗑）与一键清空，连带清理未完成确认
-
-## v2.3 单页极简化
-
-- 只保留 **教练页 + 登录页**，移除仪表盘/趋势/周报/计划页面与全部导航
-- 画布空闲时自动显示**今日概览**（今日动作明细/近7天实际完成与计划依从/最新指标），点"回到概览"可随时恢复
-- 趋势/周报/计划改为对话查询 + 画布渲染（get_analytics/get_plan）
-- 移除 show_view 工具与 naive-ui 依赖
-
-## v2.4 课表替换工具
-
-- 新增 `replace_day_plan`：整天替换训练（改类型+清原组+写新组，仅限 planned），preview 展示新旧对比
-- `adjust_plan` 收窄为“微调当天已有动作”，向完整课表日新增动作会被确定性重定向到 replace_day_plan
-
-## v2.5 动作身份解析 + 证据画布
-
-### 动作库不再依赖“模型猜中唯一名称”
-
-- 新增 `exercise_aliases`：一个 canonical 动作可绑定中文/英文/口语别名；内置 `卧推/胸推/bench press → 杠铃卧推` 等常见映射
-- 写入路径统一走 resolver：**canonical 原名 → 存储别名 → 语义/字符模糊匹配**
-- 语义匹配以动作模式优先，器械与体位只用于排序；高置信模糊词确认后自动沉淀为 learned alias
-- `log_training / adjust_plan / replace_day_plan` 遇到真正新动作时不再跳过；预览显示 `new_exercises`，用户确认本次训练后自动建库并写入组数
-- `manage_exercises` 新增 `action=alias`，可把不同叫法归并到标准动作，避免重复 add
-
-### 画布设计范式：结论 → 证据 → 数据
-
-- 默认画布改为“训练决策简报”：先给今日执行结论/恢复状态，再展示指标卡、计算口径、样本窗口与 caveat
-- ACWR 显示 0.8-1.3 参考区间，并明确 sRPE 与时长估算的局限；e1RM/容量图附公式与口径
-- 身体指标拆成体重/睡眠/静息心率/HRV四个独立量纲面板，不再把 kg、h、bpm、ms 混在同一 Y 轴；静息心率与 HRV 可来自运动手表，但需固定来源/时段解读
-- 趋势图取消平滑插值，避免视觉曲线制造不存在的中间峰值/谷值
-
-## v2.6 录入一致性与画布产品形态
-
-### 同日身体指标按字段合并
-
-- `body_metrics` 改为 upsert merge：后录睡眠不会清空体重/静息心率/HRV
-- 确认卡显示“旧值 → 新值（本次写入/保留）”和合并规则
-- 写入成功后画布自动回到并刷新今日简报
-
-### 训练课改为“计划 vs 实际”双轨
-
-- session 新增 `planned_notes` / `actual_notes`，旧 `notes` 自动按状态迁移
-- `update_session` 支持直接更新 `status`，禁止再用备注表达“已完成”
-- 训练课卡片由实际组次/跑步记录推断有效状态，计划和完成备注分区展示
-- RPE/睡眠不再作为训练课列表主信息，只在存在时作为次要信息显示
-
-### 画布形态：当前结果 + 最近历史
-
-- 新可视化结果自动成为“当前结果”并置顶
-- 最近12个结果保留为可点选历史，不再4条后挤出
-- “回到概览”只切换回今日简报，不清空历史
-
-## v2.7 微信弱网与Agent轮次恢复
-
-- SSE每15秒发送透明心跳，减少微信WebView/移动网关空闲断流
-- Agent轮次放入服务端生产者线程；手机切网或页面关闭后，服务端可继续完成并写入SQLite
-- 前端在发送前持久化“进行中轮次”，重新进入页面后自动轮询并恢复结果
-- 未点击的写操作确认卡可从SQLite只读恢复，不会因刷新/断网丢失
-- 复杂工具查询最终总结为空时，先压缩工具上下文重试；仍失败则输出可读提示，不再把半截JSON暴露给用户
-- 身体指标写入按字段去重：模型带回已有值但没有变化时直接no-op，不再弹出确认卡；仅实际变化字段进入确认预览
+训练数据保存在 `data/fitness.db` 单文件 SQLite 数据库中，复制该文件即可备份。系统会在每日首次写入时自动创建当日备份。
