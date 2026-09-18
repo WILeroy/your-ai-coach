@@ -26,6 +26,8 @@ sudo nginx -t && sudo systemctl reload nginx
 # 然后在 .env 设置 COOKIE_SECURE=true 并 ./start.sh restart
 ```
 
+访问入口：`https://服务器IP:5200`（复用云安全组已放行端口，仍强制 TLS；明文 HTTP 会返回 400）。
+若在云控制台放行 443，可同时使用 `https://服务器IP/`。
 无域名时默认使用自签证书（浏览器会提示一次风险确认）；绑定域名后可用
 `sudo certbot --nginx -d 你的域名` 换成受信证书。
 

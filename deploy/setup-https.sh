@@ -1,5 +1,5 @@
 #!/bin/bash
-# 一键部署: nginx + 自签HTTPS反代 + gunicorn 绑定 127.0.0.1
+# 一键部署: nginx + 自签HTTPS反代 + gunicorn 绑定 127.0.0.1:5210
 # 有域名后可: sudo certbot --nginx -d 你的域名
 set -euo pipefail
 
@@ -30,7 +30,7 @@ sudo ln -sf /etc/nginx/sites-available/fit-ai-coach /etc/nginx/sites-enabled/fit
 sudo rm -f /etc/nginx/sites-enabled/default
 
 echo "[4/5] gunicorn 改绑 127.0.0.1:5200..."
-sudo sed -i 's|--bind [^ ]*|--bind 127.0.0.1:5200|' /etc/systemd/system/${SERVICE}.service
+sudo sed -i 's|--bind [^ ]*|--bind 127.0.0.1:5210|' /etc/systemd/system/${SERVICE}.service
 sudo systemctl daemon-reload
 
 echo "[5/5] 重载 nginx 并重启应用..."
@@ -40,6 +40,7 @@ sudo systemctl reload nginx
 sudo systemctl restart ${SERVICE}
 
 echo
-echo "✅ 完成。HTTPS 访问: https://${PUBLIC_IP}"
-echo "   gunicorn 仅监听 127.0.0.1:5200 (公网无法直连)"
+echo "✅ 完成。HTTPS 访问: https://${PUBLIC_IP}:5200 (复用已放行端口)"
+echo "   若云安全组已放行443，也可直接用 https://${PUBLIC_IP}/"
+echo "   gunicorn 仅监听 127.0.0.1:5210 (公网无法直连)"
 echo "   提醒: 在 .env 打开 COOKIE_SECURE=true 后执行 ./start.sh restart"

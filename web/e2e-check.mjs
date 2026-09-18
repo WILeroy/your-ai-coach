@@ -1,6 +1,6 @@
 import { chromium } from 'playwright-core'
 const PW = process.env.FIT_PW
-const BASE = process.env.FIT_BASE_URL || 'https://127.0.0.1'
+const BASE = process.env.FIT_BASE_URL || 'https://127.0.0.1:5200'
 const browser = await chromium.launch({ args: ['--ignore-certificate-errors'] })
 const page = await browser.newPage({ viewport: { width: 1380, height: 850 } })
 const results = []
